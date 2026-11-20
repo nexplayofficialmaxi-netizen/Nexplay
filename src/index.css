@@ -1,0 +1,128 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Outfit", system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+:root {
+  --accent-main: #10b981;
+  --accent-hover: #059669;
+  --accent-text: #047857;
+  --accent-on: #022c22;
+  --accent-soft: rgba(16, 185, 129, 0.12);
+  --accent-border: rgba(16, 185, 129, 0.45);
+}
+
+.dark {
+  --accent-text: #34d399;
+}
+
+:root[data-accent="emerald"] {
+  --accent-main: #10b981;
+  --accent-hover: #34d399;
+  --accent-text: #047857;
+  --accent-on: #052e16;
+  --accent-soft: rgba(16, 185, 129, 0.14);
+  --accent-border: rgba(16, 185, 129, 0.5);
+}
+.dark[data-accent="emerald"] {
+  --accent-text: #34d399;
+}
+
+:root[data-accent="blue"] {
+  --accent-main: #2563eb;
+  --accent-hover: #3b82f6;
+  --accent-text: #1d4ed8;
+  --accent-on: #ffffff;
+  --accent-soft: rgba(37, 99, 235, 0.14);
+  --accent-border: rgba(59, 130, 246, 0.5);
+}
+.dark[data-accent="blue"] {
+  --accent-text: #60a5fa;
+}
+
+:root[data-accent="cyan"] {
+  --accent-main: #06b6d4;
+  --accent-hover: #22d3ee;
+  --accent-text: #0e7490;
+  --accent-on: #083344;
+  --accent-soft: rgba(6, 182, 212, 0.14);
+  --accent-border: rgba(34, 211, 238, 0.5);
+}
+.dark[data-accent="cyan"] {
+  --accent-text: #22d3ee;
+}
+
+:root[data-accent="amber"] {
+  --accent-main: #f59e0b;
+  --accent-hover: #fbbf24;
+  --accent-text: #b45309;
+  --accent-on: #1c1917;
+  --accent-soft: rgba(245, 158, 11, 0.14);
+  --accent-border: rgba(245, 158, 11, 0.5);
+}
+.dark[data-accent="amber"] {
+  --accent-text: #fbbf24;
+}
+
+:root[data-accent="red"] {
+  --accent-main: #dc2626;
+  --accent-hover: #ef4444;
+  --accent-text: #b91c1c;
+  --accent-on: #ffffff;
+  --accent-soft: rgba(220, 38, 38, 0.14);
+  --accent-border: rgba(239, 68, 68, 0.5);
+}
+.dark[data-accent="red"] {
+  --accent-text: #f87171;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+.f1-simulador-scope .font-display,
+.f1-simulador-scope h1,
+.f1-simulador-scope h2,
+.f1-simulador-scope h3,
+.f1-simulador-scope h4 {
+  font-family: 'Chakra Petch', system-ui, sans-serif;
+}
+
+.nexracing-scope .font-display,
+.nexracing-scope h1,
+.nexracing-scope h2,
+.nexracing-scope h3,
+.nexracing-scope h4 {
+  font-family: 'Barlow Condensed', system-ui, sans-serif;
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+

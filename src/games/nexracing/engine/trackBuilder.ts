@@ -1,0 +1,1016 @@
+import * as THREE from 'three';
+import { CompiledTrack } from './trackMath';
+import { CircuitTheme, GraphicsQuality } from '../types/game';
+
+export interface BuiltTrackScene {
+  group: THREE.Group;
+  lightBulbs: THREE.Mesh[];
+  cameraFlashMesh: THREE.InstancedMesh | null;
+  cameraFlashPositions: THREE.Vector3[];
+  dispose: () => void;
+}
+
+function createAsphaltTexture(maxAnisotropy: number): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext('2d')!;
+
+  ctx.fillStyle = '#252830';
+  ctx.fillRect(0, 0, 256, 256);
+
+  const groove = ctx.createLinearGradient(0, 0, 256, 0);
+  groove.addColorStop(0, 'rgba(12,14,18,0.0)');
+  groove.addColorStop(0.28, 'rgba(12,14,18,0.42)');
+  groove.addColorStop(0.68, 'rgba(12,14,18,0.46)');
+  groove.addColorStop(1, 'rgba(12,14,18,0.0)');
+  ctx.fillStyle = groove;
+  ctx.fillRect(0, 0, 256, 256);
+
+  for (let i = 0; i < 1600; i++) {
+    const x = Math.random() * 256;
+    const y = Math.random() * 256;
+    const v = 30 + Math.floor(Math.random() * 28);
+    ctx.fillStyle = `rgb(${v},${v + 2},${v + 5})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // NASCAR double yellow apron line & white outer wall line
+  ctx.fillStyle = '#FACC15';
+  ctx.fillRect(10, 0, 4, 256);
+  ctx.fillRect(17, 0, 4, 256);
+  ctx.fillStyle = '#F8FAFC';
+  ctx.fillRect(241, 0, 5, 256);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.fillRect(126, 20, 4, 90);
+  ctx.fillRect(126, 145, 4, 90);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  return tex;
+}
+
+function createCheckeredStartTexture(maxAnisotropy: number): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 64;
+  const ctx = c.getContext('2d')!;
+  const size = 16;
+  for (let y = 0; y < 64; y += size) {
+    for (let x = 0; x < 256; x += size) {
+      ctx.fillStyle = (x / size + y / size) % 2 === 0 ? '#F8FAFC' : '#0F172A';
+      ctx.fillRect(x, y, size, size);
+    }
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  return tex;
+}
+
+function createBannerTexture(label: string, bg: string, fg: string): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 128;
+  const ctx = c.getContext('2d')!;
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, 512, 128);
+  ctx.fillStyle = '#E11D48';
+  ctx.fillRect(0, 0, 18, 128);
+  ctx.fillRect(494, 0, 18, 128);
+  ctx.fillStyle = fg;
+  ctx.font = '800 50px "Barlow Condensed", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, 256, 66);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+export function getThemeAtmosphere(theme: CircuitTheme) {
+  switch (theme) {
+    case 'talladega_sunset':
+      return {
+        skyColor: 0xd97746,
+        fogColor: 0xc86d42,
+        groundColor: 0x3b6335,
+        infieldColor: 0x365c32,
+        sunColor: 0xffc88a,
+        sunIntensity: 2.3,
+        hemiSky: 0xfdba74,
+        hemiGround: 0x365314,
+      };
+    case 'charlotte_night':
+      return {
+        skyColor: 0x070b17,
+        fogColor: 0x0a1022,
+        groundColor: 0x16241b,
+        infieldColor: 0x1b2e22,
+        sunColor: 0xe0e7ff,
+        sunIntensity: 1.65,
+        hemiSky: 0x475569,
+        hemiGround: 0x0f172a,
+      };
+    case 'bristol_night':
+      return {
+        skyColor: 0x050811,
+        fogColor: 0x080e1d,
+        groundColor: 0x131e18,
+        infieldColor: 0x18261e,
+        sunColor: 0xeef2ff,
+        sunIntensity: 1.85,
+        hemiSky: 0x64748b,
+        hemiGround: 0x0f172a,
+      };
+    case 'daytona_day':
+    default:
+      return {
+        skyColor: 0x62a8e5,
+        fogColor: 0x8ec5f4,
+        groundColor: 0x2f5a38,
+        infieldColor: 0x3b6f45,
+        sunColor: 0xfffbeb,
+        sunIntensity: 2.25,
+        hemiSky: 0x93c5fd,
+        hemiGround: 0x3f6212,
+      };
+  }
+}
+
+export function buildTrackScene(
+  track: CompiledTrack,
+  quality: GraphicsQuality,
+  maxAnisotropy: number,
+): BuiltTrackScene {
+  const group = new THREE.Group();
+  const disposables: Array<{ dispose: () => void }> = [];
+  const lightBulbs: THREE.Mesh[] = [];
+  const theme = getThemeAtmosphere(track.spec.theme);
+  const isNight = track.spec.isNight;
+
+  const samples = track.samples;
+  const n = samples.length;
+  const halfW = track.spec.trackWidth * 0.5;
+
+  // 1. Vast Stadium Ground Plane
+  const groundGeo = new THREE.PlaneGeometry(3600, 3600);
+  groundGeo.rotateX(-Math.PI / 2);
+  const groundMat = new THREE.MeshStandardMaterial({
+    color: theme.groundColor,
+    roughness: 0.95,
+    metalness: 0.0,
+  });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.position.y = -0.05;
+  ground.receiveShadow = true;
+  group.add(ground);
+  disposables.push(groundGeo, groundMat);
+
+  // 2. Banked Asphalt Track Ribbon + Outer SAFER Wall + Inner Apron Wall (with Pit Opening!)
+  const roadVerts: number[] = [];
+  const roadUvs: number[] = [];
+  const roadIdx: number[] = [];
+
+  const outerWallVerts: number[] = [];
+  const outerWallIdx: number[] = [];
+
+  const innerWallVerts: number[] = [];
+  const innerWallIdx: number[] = [];
+
+function createPitRoadTexture(maxAnisotropy: number): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const ctx = c.getContext('2d')!;
+
+  // Distinct lighter concrete surface so Pit Road contrasts sharply with dark track asphalt
+  ctx.fillStyle = '#4B5563';
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Subtle concrete slab joints & grain
+  for (let i = 0; i < 900; i++) {
+    const x = Math.random() * 256;
+    const y = Math.random() * 256;
+    const v = 68 + Math.floor(Math.random() * 26);
+    ctx.fillStyle = `rgb(${v},${v + 4},${v + 10})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.22)';
+  ctx.fillRect(0, 126, 256, 3);
+
+  // Bright red/white NASCAR curbing along track-side edge (right side of pit UV = u near 1)
+  for (let y = 0; y < 256; y += 32) {
+    ctx.fillStyle = (y / 32) % 2 === 0 ? '#EF4444' : '#F8FAFC';
+    ctx.fillRect(238, y, 18, 32);
+  }
+
+  // Bright amber speed-limit boundary & emerald pit guide stripe down Pit Road
+  ctx.fillStyle = '#FACC15';
+  ctx.fillRect(226, 0, 6, 256);
+
+  ctx.fillStyle = '#10B981';
+  ctx.fillRect(118, 12, 8, 96);
+  ctx.fillRect(118, 144, 8, 96);
+
+  // White painted Pit Stall Box lines on the inner half
+  ctx.fillStyle = '#F8FAFC';
+  ctx.fillRect(16, 0, 6, 256);
+  ctx.fillRect(16, 12, 74, 5);
+  ctx.fillRect(16, 238, 74, 5);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  return tex;
+}
+
+  // Pit Lane ribbon (along frontstretch sNorm 0.80..0.20, highly visible)
+  const pitVerts: number[] = [];
+  const pitUvs: number[] = [];
+  const pitIdx: number[] = [];
+  let pitVertCount = 0;
+  let pitVAccum = 0;
+
+  let vAccum = 0;
+  for (let i = 0; i <= n; i++) {
+    const s = samples[i % n];
+    if (i > 0) {
+      const segDist = s.position.distanceTo(samples[(i - 1) % n].position);
+      vAccum += segDist / 14;
+      pitVAccum += segDist / 18;
+    }
+
+    const bankRise = halfW * Math.tan(s.bank);
+    const leftEdge = s.position
+      .clone()
+      .addScaledVector(s.right, -halfW)
+      .add(new THREE.Vector3(0, -bankRise, 0));
+    const rightEdge = s.position
+      .clone()
+      .addScaledVector(s.right, halfW)
+      .add(new THREE.Vector3(0, bankRise, 0));
+
+    roadVerts.push(leftEdge.x, leftEdge.y, leftEdge.z);
+    roadVerts.push(rightEdge.x, rightEdge.y, rightEdge.z);
+    roadUvs.push(0, vAccum);
+    roadUvs.push(1, vAccum);
+
+    // Outer SAFER barrier wall (with open grass access gate on backstretch sNorm 0.45..0.56)
+    const inGrassGate = s.sNorm >= 0.45 && s.sNorm <= 0.56;
+    const wallBottom = rightEdge.clone().addScaledVector(s.right, 0.35);
+    const wallTop = wallBottom.clone().add(new THREE.Vector3(0, 2.5, 0));
+    outerWallVerts.push(wallBottom.x, wallBottom.y - 0.3, wallBottom.z);
+    outerWallVerts.push(wallTop.x, wallTop.y, wallTop.z);
+
+    // Low inner apron curb (drivable so players can exit freely onto the infield grass!)
+    const inPitZone = s.sNorm >= 0.80 || s.sNorm <= 0.20;
+    const inOffset = inPitZone ? -12.5 : -0.6;
+    const inBottom = leftEdge.clone().addScaledVector(s.right, inOffset);
+    const inTop = inBottom.clone().add(new THREE.Vector3(0, 0.14, 0));
+    innerWallVerts.push(inBottom.x, Math.max(0.02, inBottom.y - 0.05), inBottom.z);
+    innerWallVerts.push(inTop.x, Math.max(0.14, inTop.y), inTop.z);
+
+    if (i < n) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      roadIdx.push(a, c, b, b, c, d);
+      if (!inGrassGate) {
+        outerWallIdx.push(a, c, b, b, c, d);
+      }
+      innerWallIdx.push(a, b, c, b, d, c);
+    }
+
+    // Flat Pit Road concrete strip along frontstretch
+    if (inPitZone) {
+      const pitOuter = leftEdge.clone().addScaledVector(s.right, 0.45);
+      const pitInner = leftEdge.clone().addScaledVector(s.right, -12.2);
+      pitVerts.push(pitInner.x, 0.06, pitInner.z);
+      pitVerts.push(pitOuter.x, 0.06, pitOuter.z);
+      pitUvs.push(0, pitVAccum);
+      pitUvs.push(1, pitVAccum);
+
+      if (pitVertCount >= 2) {
+        const prevS = samples[(i - 1 + n) % n].sNorm;
+        const gapJump = Math.abs(s.sNorm - prevS) > 0.2 && Math.abs(s.sNorm - prevS) < 0.8;
+        if (!gapJump) {
+          const pA = pitVertCount - 2;
+          const pB = pitVertCount - 1;
+          const pC = pitVertCount;
+          const pD = pitVertCount + 1;
+          pitIdx.push(pA, pC, pB, pB, pC, pD);
+        }
+      }
+      pitVertCount += 2;
+    }
+  }
+
+  const roadGeo = new THREE.BufferGeometry();
+  roadGeo.setAttribute('position', new THREE.Float32BufferAttribute(roadVerts, 3));
+  roadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(roadUvs, 2));
+  roadGeo.setIndex(roadIdx);
+  roadGeo.computeVertexNormals();
+
+  const asphaltTex = createAsphaltTexture(maxAnisotropy);
+  const roadMat = new THREE.MeshStandardMaterial({
+    map: asphaltTex,
+    roughness: 0.75,
+    metalness: 0.08,
+    side: THREE.DoubleSide,
+  });
+  const roadMesh = new THREE.Mesh(roadGeo, roadMat);
+  roadMesh.receiveShadow = true;
+  group.add(roadMesh);
+  disposables.push(roadGeo, roadMat, asphaltTex);
+
+  // Pit Road Concrete Mesh with High-Contrast Markings
+  if (pitIdx.length > 0) {
+    const pitGeo = new THREE.BufferGeometry();
+    pitGeo.setAttribute('position', new THREE.Float32BufferAttribute(pitVerts, 3));
+    pitGeo.setAttribute('uv', new THREE.Float32BufferAttribute(pitUvs, 2));
+    pitGeo.setIndex(pitIdx);
+    pitGeo.computeVertexNormals();
+    const pitTex = createPitRoadTexture(maxAnisotropy);
+    const pitMat = new THREE.MeshStandardMaterial({
+      map: pitTex,
+      roughness: 0.78,
+      metalness: 0.05,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const pitMesh = new THREE.Mesh(pitGeo, pitMat);
+    pitMesh.receiveShadow = true;
+    group.add(pitMesh);
+    disposables.push(pitGeo, pitMat, pitTex);
+  }
+
+  // Painted Pit Stop Box + Overhead Entry Arch + Pit Crew Boxes
+  const startSample = samples[0];
+  const startYaw = Math.atan2(startSample.tangent.x, startSample.tangent.z);
+  const pitStallPos = startSample.position.clone().addScaledVector(startSample.right, -halfW - 6.2);
+
+  const pitBoxGeo = new THREE.PlaneGeometry(7.2, 16);
+  pitBoxGeo.rotateX(-Math.PI / 2);
+  const pitBoxMat = new THREE.MeshBasicMaterial({
+    color: 0x10b981,
+    transparent: true,
+    opacity: 0.68,
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -3,
+  });
+  const pitBox = new THREE.Mesh(pitBoxGeo, pitBoxMat);
+  pitBox.position.set(pitStallPos.x, 0.12, pitStallPos.z);
+  pitBox.rotation.y = startYaw;
+  group.add(pitBox);
+
+  // Glowing emerald border around Pit Stall Box
+  const pitBorderGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(7.6, 0.15, 16.4));
+  const pitBorderMat = new THREE.LineBasicMaterial({ color: 0x6ee7b7 });
+  const pitBorder = new THREE.LineSegments(pitBorderGeo, pitBorderMat);
+  pitBorder.position.set(pitStallPos.x, 0.16, pitStallPos.z);
+  pitBorder.rotation.y = startYaw;
+  group.add(pitBorder);
+
+  // Pit Signboard ("TU BOX PITS · FRENA AQUÍ")
+  const pitSignGeo = new THREE.BoxGeometry(8.5, 2.5, 0.45);
+  const pitSignTex = createBannerTexture('PITS · FRENA AQUÍ (GAS / RUEDAS)', '#064E3B', '#A7F3D0');
+  const pitSignMat = new THREE.MeshStandardMaterial({
+    map: pitSignTex,
+    emissive: 0x059669,
+    emissiveIntensity: isNight ? 1.15 : 0.45,
+  });
+  const pitSign = new THREE.Mesh(pitSignGeo, pitSignMat);
+  const pitSignPos = startSample.position.clone().addScaledVector(startSample.right, -halfW - 11.4);
+  pitSign.position.set(pitSignPos.x, 3.2, pitSignPos.z);
+  pitSign.rotation.y = startYaw + Math.PI / 2;
+  group.add(pitSign);
+  disposables.push(pitBoxGeo, pitBoxMat, pitBorderGeo, pitBorderMat, pitSignGeo, pitSignTex, pitSignMat);
+
+  // Overhead Pit Entry Arch at sNorm = 0.82 so players spot Pit Entry early!
+  const pitEntrySample = samples[Math.floor(0.82 * n) % n];
+  const pitEntryYaw = Math.atan2(pitEntrySample.tangent.x, pitEntrySample.tangent.z);
+  const pitEntryPos = pitEntrySample.position.clone().addScaledVector(pitEntrySample.right, -halfW - 6.2);
+  const pitArchGroup = new THREE.Group();
+  pitArchGroup.position.set(pitEntryPos.x, 0, pitEntryPos.z);
+  pitArchGroup.rotation.y = pitEntryYaw;
+
+  const archPostGeo = new THREE.BoxGeometry(0.65, 6.4, 0.65);
+  const archPostMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, roughness: 0.4, metalness: 0.3 });
+  const archPostL = new THREE.Mesh(archPostGeo, archPostMat);
+  archPostL.position.set(-5.6, 3.2, 0);
+  const archPostR = new THREE.Mesh(archPostGeo, archPostMat);
+  archPostR.position.set(5.6, 3.2, 0);
+  pitArchGroup.add(archPostL, archPostR);
+
+  const archBannerGeo = new THREE.BoxGeometry(12.2, 1.8, 0.7);
+  const archBannerTex = createBannerTexture('ENTRADA PITS  >>>', '#065F46', '#ECFDF5');
+  const archBannerMat = new THREE.MeshStandardMaterial({
+    map: archBannerTex,
+    emissive: 0x10b981,
+    emissiveIntensity: isNight ? 1.25 : 0.45,
+  });
+  const archBanner = new THREE.Mesh(archBannerGeo, archBannerMat);
+  archBanner.position.set(0, 6.2, 0);
+  pitArchGroup.add(archBanner);
+  group.add(pitArchGroup);
+  disposables.push(archPostGeo, archPostMat, archBannerGeo, archBannerTex, archBannerMat);
+
+  // Pit Toolboxes along inner pit wall (no floating cones)
+  const coneDummy = new THREE.Object3D();
+  const toolboxGeo = new THREE.BoxGeometry(2.4, 1.5, 4.2);
+  const toolboxMat = new THREE.MeshStandardMaterial({ roughness: 0.5, metalness: 0.35 });
+  const stallSpots = [0.89, 0.92, 0.95, 0.04, 0.08, 0.11];
+  const toolboxInst = new THREE.InstancedMesh(toolboxGeo, toolboxMat, stallSpots.length);
+  const stallPalette = [0xe11d48, 0x2563eb, 0xfacc15, 0x10b981, 0xf97316, 0x38bdf8];
+  const stallColor = new THREE.Color();
+  stallSpots.forEach((sn, idx) => {
+    const cs = samples[Math.floor(sn * n) % n];
+    const cp = cs.position.clone().addScaledVector(cs.right, -halfW - 10.6);
+    const cyaw = Math.atan2(cs.tangent.x, cs.tangent.z);
+    coneDummy.position.set(cp.x, 0.78, cp.z);
+    coneDummy.rotation.set(0, cyaw, 0);
+    coneDummy.scale.set(1, 1, 1);
+    coneDummy.updateMatrix();
+    toolboxInst.setMatrixAt(idx, coneDummy.matrix);
+    stallColor.setHex(stallPalette[idx % stallPalette.length]);
+    toolboxInst.setColorAt(idx, stallColor);
+  });
+  toolboxInst.instanceMatrix.needsUpdate = true;
+  if (toolboxInst.instanceColor) toolboxInst.instanceColor.needsUpdate = true;
+  group.add(toolboxInst);
+  disposables.push(toolboxGeo, toolboxMat);
+
+  // Outer SAFER Barrier
+  const outerWallGeo = new THREE.BufferGeometry();
+  outerWallGeo.setAttribute('position', new THREE.Float32BufferAttribute(outerWallVerts, 3));
+  outerWallGeo.setIndex(outerWallIdx);
+  outerWallGeo.computeVertexNormals();
+  const wallMat = new THREE.MeshStandardMaterial({
+    color: 0xe2e8f0,
+    roughness: 0.62,
+    metalness: 0.15,
+    side: THREE.DoubleSide,
+  });
+  const outerWallMesh = new THREE.Mesh(outerWallGeo, wallMat);
+  outerWallMesh.receiveShadow = true;
+  group.add(outerWallMesh);
+  disposables.push(outerWallGeo, wallMat);
+
+  // Inner Wall
+  const innerWallGeo = new THREE.BufferGeometry();
+  innerWallGeo.setAttribute('position', new THREE.Float32BufferAttribute(innerWallVerts, 3));
+  innerWallGeo.setIndex(innerWallIdx);
+  innerWallGeo.computeVertexNormals();
+  const innerWallMat = new THREE.MeshStandardMaterial({
+    color: 0xdc2626,
+    roughness: 0.6,
+    metalness: 0.15,
+    side: THREE.DoubleSide,
+  });
+  const innerWallMesh = new THREE.Mesh(innerWallGeo, innerWallMat);
+  group.add(innerWallMesh);
+  disposables.push(innerWallGeo, innerWallMat);
+
+  // 3. Instanced Catchfence Posts around Outer Wall
+  const postStep = quality === 'low' ? 6 : 3;
+  const postCount = Math.floor(n / postStep);
+  const postGeo = new THREE.CylinderGeometry(0.09, 0.09, 4.8, 6);
+  const postMat = new THREE.MeshStandardMaterial({
+    color: 0x94a3b8,
+    metalness: 0.75,
+    roughness: 0.35,
+  });
+  const postInstances = new THREE.InstancedMesh(postGeo, postMat, postCount);
+  const dummy = new THREE.Object3D();
+  for (let idx = 0; idx < postCount; idx++) {
+    const s = samples[(idx * postStep) % n];
+    if (s.sNorm >= 0.45 && s.sNorm <= 0.56) {
+      dummy.position.set(0, -100, 0);
+      dummy.scale.set(0.01, 0.01, 0.01);
+      dummy.updateMatrix();
+      postInstances.setMatrixAt(idx, dummy.matrix);
+      continue;
+    }
+    const bankRise = halfW * Math.tan(s.bank);
+    const p = s.position.clone().addScaledVector(s.right, halfW + 0.55);
+    dummy.position.set(p.x, p.y + bankRise + 2.3, p.z);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    postInstances.setMatrixAt(idx, dummy.matrix);
+  }
+  postInstances.instanceMatrix.needsUpdate = true;
+  postInstances.computeBoundingSphere();
+  group.add(postInstances);
+  disposables.push(postGeo, postMat);
+
+  // 4. Start / Finish Line Strip + Gantry Arch with 3D Starting Lights
+  const startLineTex = createCheckeredStartTexture(maxAnisotropy);
+  const startLineGeo = new THREE.PlaneGeometry(track.spec.trackWidth - 1.5, 4.2);
+  startLineGeo.rotateX(-Math.PI / 2);
+  const startLineMat = new THREE.MeshStandardMaterial({
+    map: startLineTex,
+    roughness: 0.65,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+  });
+  const startLine = new THREE.Mesh(startLineGeo, startLineMat);
+  startLine.position.copy(startSample.position);
+  startLine.position.y += 0.04;
+  startLine.rotation.y = startYaw;
+  group.add(startLine);
+  disposables.push(startLineGeo, startLineMat, startLineTex);
+
+  const gantry = new THREE.Group();
+  gantry.position.copy(startSample.position);
+  gantry.rotation.y = startYaw;
+
+  const pillarGeo = new THREE.BoxGeometry(1.1, 10.5, 1.1);
+  const gantryMat = new THREE.MeshStandardMaterial({
+    color: 0x111827,
+    metalness: 0.6,
+    roughness: 0.35,
+  });
+  const pLeft = new THREE.Mesh(pillarGeo, gantryMat);
+  pLeft.position.set(-halfW - 1.2, 5.2, 0);
+  const pRight = new THREE.Mesh(pillarGeo, gantryMat);
+  pRight.position.set(halfW + 1.2, 5.2, 0);
+  gantry.add(pLeft, pRight);
+
+  const beamGeo = new THREE.BoxGeometry(track.spec.trackWidth + 3.6, 2.5, 1.5);
+  const bannerTex = createBannerTexture('AYSÉN · NASCAR CUP', '#0F172A', '#F8FAFC');
+  const beamMat = new THREE.MeshStandardMaterial({
+    map: bannerTex,
+    roughness: 0.4,
+    metalness: 0.25,
+    emissive: isNight ? 0x1e293b : 0x000000,
+    emissiveIntensity: isNight ? 0.5 : 0,
+  });
+  const beam = new THREE.Mesh(beamGeo, beamMat);
+  beam.position.set(0, 9.5, 0);
+  gantry.add(beam);
+
+  const bulbGeo = new THREE.SphereGeometry(0.45, 12, 12);
+  for (let b = 0; b < 4; b++) {
+    const bulbMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      emissive: 0x111827,
+      emissiveIntensity: 0.4,
+      roughness: 0.2,
+    });
+    const bulb = new THREE.Mesh(bulbGeo, bulbMat);
+    bulb.position.set(-3.6 + b * 2.4, 7.8, -0.85);
+    gantry.add(bulb);
+    lightBulbs.push(bulb);
+    disposables.push(bulbMat);
+  }
+  group.add(gantry);
+  disposables.push(pillarGeo, gantryMat, beamGeo, beamMat, bannerTex, bulbGeo);
+
+  // 5. FULL PACKED STADIUM BOWL GRANDSTANDS + THOUSANDS OF INSTANCED SPECTATORS!
+  const standGeo = new THREE.BoxGeometry(42, 16, 18);
+  const standMat = new THREE.MeshStandardMaterial({
+    color: 0x1e293b,
+    roughness: 0.7,
+    metalness: 0.25,
+  });
+  const roofGeo = new THREE.BoxGeometry(44, 0.9, 19);
+  const roofMat = new THREE.MeshStandardMaterial({
+    color: 0xe11d48,
+    roughness: 0.4,
+    metalness: 0.3,
+  });
+
+  // Dense ring of grandstands all around the circuit (14 mega-grandstand sections!)
+  const standCount = 14;
+  const crowdSpots: THREE.Vector3[] = [];
+  const cameraFlashPositions: THREE.Vector3[] = [];
+
+  for (let st = 0; st < standCount; st++) {
+    const sNorm = st / standCount;
+    if (sNorm >= 0.42 && sNorm <= 0.58) continue; // Keep backstretch grass exit open!
+    const smp = samples[Math.floor(sNorm * n) % n];
+    const yaw = Math.atan2(smp.tangent.x, smp.tangent.z);
+    const outPos = smp.position.clone().addScaledVector(smp.right, halfW + 22);
+
+    const standGroup = new THREE.Group();
+    standGroup.position.set(outPos.x, 0, outPos.z);
+    standGroup.rotation.y = yaw + Math.PI / 2;
+
+    const base = new THREE.Mesh(standGeo, standMat);
+    base.position.y = 8;
+    standGroup.add(base);
+
+    const top = new THREE.Mesh(roofGeo, roofMat);
+    top.position.y = 16.6;
+    standGroup.add(top);
+
+    group.add(standGroup);
+
+    const rows = quality === 'low' ? 3 : 5;
+    const cols = quality === 'low' ? 16 : 30;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const local = new THREE.Vector3(
+          -19 + (c / (cols - 1)) * 38,
+          3.2 + r * 2.55,
+          -8.2 + r * 2.1,
+        );
+        local.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw + Math.PI / 2);
+        local.add(new THREE.Vector3(outPos.x, 0, outPos.z));
+        crowdSpots.push(local);
+
+        if (isNight && (r + c) % 19 === 0) {
+          cameraFlashPositions.push(local.clone().add(new THREE.Vector3(0, 1.1, 0)));
+        }
+      }
+    }
+  }
+  disposables.push(standGeo, standMat, roofGeo, roofMat);
+
+  if (crowdSpots.length > 0) {
+    const specGeo = new THREE.BoxGeometry(0.68, 1.4, 0.58);
+    const specMat = new THREE.MeshStandardMaterial({
+      roughness: 0.75,
+      emissive: isNight ? 0x1e293b : 0x000000,
+      emissiveIntensity: isNight ? 0.55 : 0,
+    });
+    const crowdMesh = new THREE.InstancedMesh(specGeo, specMat, crowdSpots.length);
+    const palette = [
+      0xef4444, 0x3b82f6, 0xfacc15, 0xf8fafc, 0x10b981, 0xf97316, 0xa855f7, 0xec4899,
+    ];
+    const color = new THREE.Color();
+    crowdSpots.forEach((pt, idx) => {
+      dummy.position.copy(pt);
+      dummy.rotation.set(0, Math.random() * Math.PI, 0);
+      const s = 0.85 + Math.random() * 0.32;
+      dummy.scale.set(s, s, s);
+      dummy.updateMatrix();
+      crowdMesh.setMatrixAt(idx, dummy.matrix);
+      color.setHex(palette[idx % palette.length]);
+      crowdMesh.setColorAt(idx, color);
+    });
+    crowdMesh.instanceMatrix.needsUpdate = true;
+    if (crowdMesh.instanceColor) crowdMesh.instanceColor.needsUpdate = true;
+    crowdMesh.computeBoundingSphere();
+    group.add(crowdMesh);
+    disposables.push(specGeo, specMat);
+  }
+
+  // Camera flashes in the night stands
+  let cameraFlashMesh: THREE.InstancedMesh | null = null;
+  if (isNight && cameraFlashPositions.length > 0) {
+    const flashGeo = new THREE.SphereGeometry(0.45, 6, 6);
+    const flashMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    cameraFlashMesh = new THREE.InstancedMesh(flashGeo, flashMat, cameraFlashPositions.length);
+    cameraFlashMesh.frustumCulled = false;
+    cameraFlashPositions.forEach((pt, i) => {
+      dummy.position.copy(pt);
+      dummy.scale.setScalar(0.01);
+      dummy.updateMatrix();
+      cameraFlashMesh!.setMatrixAt(i, dummy.matrix);
+    });
+    cameraFlashMesh.instanceMatrix.needsUpdate = true;
+    group.add(cameraFlashMesh);
+    disposables.push(flashGeo, flashMat);
+  }
+
+  // 6. Infield NASCAR Paddock, Team Semi-Trucks, Parked Fan Cars & Grass Crowd!
+  const pitBuildingGeo = new THREE.BoxGeometry(58, 7.5, 14);
+  const pitBuildingMat = new THREE.MeshStandardMaterial({
+    color: 0x334155,
+    roughness: 0.65,
+    metalness: 0.25,
+  });
+  const pitPos = startSample.position.clone().addScaledVector(startSample.right, -halfW - 26);
+  const pitMesh = new THREE.Mesh(pitBuildingGeo, pitBuildingMat);
+  pitMesh.position.set(pitPos.x, 3.75, pitPos.z);
+  pitMesh.rotation.y = startYaw + Math.PI / 2;
+  group.add(pitMesh);
+
+  // Helper to ensure infield/outer grass props never overlap track, Pit Road, or grandstands
+  const isClearGrassPoint = (px: number, pz: number, minTrackClearance: number): boolean => {
+    let minD2 = Infinity;
+    for (let i = 0; i < n; i += 4) {
+      const sp = samples[i].position;
+      const dx = px - sp.x;
+      const dz = pz - sp.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < minD2) minD2 = d2;
+    }
+    return minD2 > minTrackClearance * minTrackClearance;
+  };
+
+  // Deterministic pseudo-random generator for reproducible grass placement
+  let seed = 4219;
+  const nextRand = () => {
+    seed = (seed * 1664525 + 1013904223) % 4294967296;
+    return seed / 4294967296;
+  };
+
+  // 6A. Composite Semi-Trucks / Camiones NASCAR (Trailer + Cab) in infield & outer fan zone
+  const trailerGeo = new THREE.BoxGeometry(11.5, 3.7, 2.7);
+  const cabGeo = new THREE.BoxGeometry(3.2, 3.0, 2.55);
+  const trailerMat = new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.35 });
+  const cabMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.32, metalness: 0.55 });
+  const truckSpots: Array<{ x: number; z: number; yaw: number; color: number }> = [];
+  const truckPalette = [0xe11d48, 0x2563eb, 0xfacc15, 0xf8fafc, 0x10b981, 0xf97316, 0x8b5cf6];
+
+  // Infield paddock rows
+  for (let row = -1; row <= 1; row++) {
+    for (let col = -4; col <= 4; col++) {
+      const tx = col * 24 + (row % 2) * 6;
+      const tz = row * 36 - 12;
+      if (Math.hypot(tx, tz) < 15) continue; // skip center scoring tower
+      if (isClearGrassPoint(tx, tz, halfW + 22)) {
+        truckSpots.push({
+          x: tx,
+          z: tz,
+          yaw: row === 0 ? 0 : Math.PI * 0.5,
+          color: truckPalette[truckSpots.length % truckPalette.length],
+        });
+      }
+    }
+  }
+  // Outer grass truck & RV convoy around stadium perimeter
+  for (let i = 0; i < 16; i++) {
+    const ang = (i / 16) * Math.PI * 2;
+    const smp = samples[Math.floor((i / 16) * n) % n];
+    const p = smp.position.clone().addScaledVector(smp.right, halfW + 46);
+    if (isClearGrassPoint(p.x, p.z, halfW + 38)) {
+      truckSpots.push({
+        x: p.x,
+        z: p.z,
+        yaw: ang + Math.PI / 2,
+        color: truckPalette[i % truckPalette.length],
+      });
+    }
+  }
+
+  if (truckSpots.length > 0) {
+    const trailers = new THREE.InstancedMesh(trailerGeo, trailerMat, truckSpots.length);
+    const cabs = new THREE.InstancedMesh(cabGeo, cabMat, truckSpots.length);
+    const tCol = new THREE.Color();
+    truckSpots.forEach((tr, idx) => {
+      dummy.position.set(tr.x, 1.85, tr.z);
+      dummy.rotation.set(0, tr.yaw, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      trailers.setMatrixAt(idx, dummy.matrix);
+      tCol.setHex(tr.color);
+      trailers.setColorAt(idx, tCol);
+
+      const cabOffX = Math.cos(tr.yaw) * 7.5;
+      const cabOffZ = -Math.sin(tr.yaw) * 7.5;
+      dummy.position.set(tr.x + cabOffX, 1.5, tr.z + cabOffZ);
+      dummy.rotation.set(0, tr.yaw, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      cabs.setMatrixAt(idx, dummy.matrix);
+    });
+    trailers.instanceMatrix.needsUpdate = true;
+    if (trailers.instanceColor) trailers.instanceColor.needsUpdate = true;
+    trailers.computeBoundingSphere();
+    cabs.instanceMatrix.needsUpdate = true;
+    cabs.computeBoundingSphere();
+    group.add(trailers, cabs);
+  }
+
+  // 6B. Parked Fan Cars, Pickups & RVs on the infield grass & outer lawns ("mas autos")
+  const pCarBodyGeo = new THREE.BoxGeometry(4.3, 0.85, 1.95);
+  const pCarTopGeo = new THREE.BoxGeometry(2.3, 0.72, 1.72);
+  const pCarMat = new THREE.MeshStandardMaterial({ roughness: 0.38, metalness: 0.4 });
+  const pCarTopMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.25, metalness: 0.5 });
+  const parkedCars: Array<{ x: number; z: number; yaw: number; color: number }> = [];
+  const carColors = [0xef4444, 0x3b82f6, 0xe2e8f0, 0xfacc15, 0x10b981, 0xf97316, 0x64748b, 0xa855f7];
+
+  for (let i = 0; i < 160 && parkedCars.length < 72; i++) {
+    const inInfield = i < 95;
+    let cx = 0;
+    let cz = 0;
+    let yaw = nextRand() * Math.PI * 2;
+    if (inInfield) {
+      cx = (nextRand() - 0.5) * (track.bounds.maxX - track.bounds.minX) * 0.65;
+      cz = (nextRand() - 0.5) * (track.bounds.maxZ - track.bounds.minZ) * 0.68;
+      if (Math.hypot(cx, cz) < 16) continue;
+      if (!isClearGrassPoint(cx, cz, halfW + 19)) continue;
+    } else {
+      const smp = samples[Math.floor(nextRand() * n) % n];
+      const outD = halfW + 40 + nextRand() * 38;
+      const p = smp.position.clone().addScaledVector(smp.right, outD);
+      cx = p.x;
+      cz = p.z;
+      yaw = Math.atan2(smp.tangent.x, smp.tangent.z);
+      if (!isClearGrassPoint(cx, cz, halfW + 36)) continue;
+    }
+    parkedCars.push({
+      x: cx,
+      z: cz,
+      yaw,
+      color: carColors[parkedCars.length % carColors.length],
+    });
+  }
+
+  if (parkedCars.length > 0) {
+    const carBodies = new THREE.InstancedMesh(pCarBodyGeo, pCarMat, parkedCars.length);
+    const carTops = new THREE.InstancedMesh(pCarTopGeo, pCarTopMat, parkedCars.length);
+    const cCol = new THREE.Color();
+    parkedCars.forEach((pc, idx) => {
+      dummy.position.set(pc.x, 0.45, pc.z);
+      dummy.rotation.set(0, pc.yaw, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      carBodies.setMatrixAt(idx, dummy.matrix);
+      cCol.setHex(pc.color);
+      carBodies.setColorAt(idx, cCol);
+
+      dummy.position.set(pc.x, 1.15, pc.z);
+      dummy.rotation.set(0, pc.yaw, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      carTops.setMatrixAt(idx, dummy.matrix);
+    });
+    carBodies.instanceMatrix.needsUpdate = true;
+    if (carBodies.instanceColor) carBodies.instanceColor.needsUpdate = true;
+    carBodies.computeBoundingSphere();
+    carTops.instanceMatrix.needsUpdate = true;
+    carTops.computeBoundingSphere();
+    group.add(carBodies, carTops);
+  }
+
+  // 6C. Hundreds of Extra Spectators standing on the infield & outer grass ("mas personas en el pasto")
+  const grassFanTarget = quality === 'low' ? 420 : 950;
+  const grassFanPts: Array<{ x: number; z: number; s: number; yaw: number }> = [];
+  for (let attempt = 0; attempt < grassFanTarget * 3 && grassFanPts.length < grassFanTarget; attempt++) {
+    const inside = attempt % 3 !== 0;
+    let fx = 0;
+    let fz = 0;
+    if (inside) {
+      fx = (nextRand() - 0.5) * (track.bounds.maxX - track.bounds.minX) * 0.78;
+      fz = (nextRand() - 0.5) * (track.bounds.maxZ - track.bounds.minZ) * 0.78;
+      if (Math.hypot(fx, fz) < 10) continue;
+      if (!isClearGrassPoint(fx, fz, halfW + 17)) continue;
+    } else {
+      const smp = samples[Math.floor(nextRand() * n) % n];
+      const outD = halfW + 38 + nextRand() * 44;
+      const p = smp.position.clone().addScaledVector(smp.right, outD);
+      fx = p.x;
+      fz = p.z;
+      if (!isClearGrassPoint(fx, fz, halfW + 36)) continue;
+    }
+    grassFanPts.push({
+      x: fx,
+      z: fz,
+      s: 0.85 + nextRand() * 0.32,
+      yaw: nextRand() * Math.PI * 2,
+    });
+  }
+
+  if (grassFanPts.length > 0) {
+    const gSpecGeo = new THREE.BoxGeometry(0.66, 1.45, 0.55);
+    const gSpecMat = new THREE.MeshStandardMaterial({
+      roughness: 0.78,
+      emissive: isNight ? 0x1e293b : 0x000000,
+      emissiveIntensity: isNight ? 0.5 : 0,
+    });
+    const grassCrowd = new THREE.InstancedMesh(gSpecGeo, gSpecMat, grassFanPts.length);
+    const fanPalette = [0xef4444, 0x3b82f6, 0xfacc15, 0xf8fafc, 0x10b981, 0xf97316, 0xa855f7, 0xec4899];
+    const fCol = new THREE.Color();
+    grassFanPts.forEach((fp, idx) => {
+      dummy.position.set(fp.x, 0.72 * fp.s, fp.z);
+      dummy.rotation.set(0, fp.yaw, 0);
+      dummy.scale.set(fp.s, fp.s, fp.s);
+      dummy.updateMatrix();
+      grassCrowd.setMatrixAt(idx, dummy.matrix);
+      fCol.setHex(fanPalette[idx % fanPalette.length]);
+      grassCrowd.setColorAt(idx, fCol);
+    });
+    grassCrowd.instanceMatrix.needsUpdate = true;
+    if (grassCrowd.instanceColor) grassCrowd.instanceColor.needsUpdate = true;
+    grassCrowd.computeBoundingSphere();
+    group.add(grassCrowd);
+    disposables.push(gSpecGeo, gSpecMat);
+  }
+  disposables.push(trailerGeo, cabGeo, trailerMat, cabMat, pCarBodyGeo, pCarTopGeo, pCarMat, pCarTopMat);
+
+  // Scoring Pylon Tower in center infield
+  const towerGeo = new THREE.CylinderGeometry(5, 6, 34, 8);
+  const towerMat = new THREE.MeshStandardMaterial({
+    color: 0x0f172a,
+    roughness: 0.4,
+    metalness: 0.6,
+  });
+  const tower = new THREE.Mesh(towerGeo, towerMat);
+  tower.position.set(0, 17, 0);
+  group.add(tower);
+
+  const towerTopGeo = new THREE.CylinderGeometry(6.8, 6.8, 6, 8);
+  const towerTopMat = new THREE.MeshStandardMaterial({
+    color: 0x38bdf8,
+    emissive: 0xe11d48,
+    emissiveIntensity: isNight ? 1.4 : 0.4,
+    roughness: 0.2,
+  });
+  const towerTop = new THREE.Mesh(towerTopGeo, towerTopMat);
+  towerTop.position.set(0, 32, 0);
+  group.add(towerTop);
+  disposables.push(
+    pitBuildingGeo,
+    pitBuildingMat,
+    towerGeo,
+    towerMat,
+    towerTopGeo,
+    towerTopMat,
+  );
+
+  // 7. STADIUM FLOODLIGHT TOWERS (Bright & Dramatic in Night Races!)
+  const poleGeo = new THREE.CylinderGeometry(0.55, 0.85, 36, 6);
+  const poleMat = new THREE.MeshStandardMaterial({
+    color: 0x64748b,
+    metalness: 0.6,
+    roughness: 0.4,
+  });
+  const headGeo = new THREE.BoxGeometry(9.5, 3.2, 1.4);
+  const headMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    emissive: 0xf8fafc,
+    emissiveIntensity: isNight ? 2.8 : 0.35,
+  });
+
+  const floodCount = isNight ? 12 : 6;
+  for (let f = 0; f < floodCount; f++) {
+    const sn = f / floodCount;
+    const smp = samples[Math.floor(sn * n) % n];
+    const p = smp.position.clone().addScaledVector(smp.right, halfW + 13);
+
+    const pole = new THREE.Mesh(poleGeo, poleMat);
+    pole.position.set(p.x, 18, p.z);
+    group.add(pole);
+
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.set(p.x, 36, p.z);
+    head.lookAt(smp.position.x, 0, smp.position.z);
+    group.add(head);
+
+    // Add real point lights on night tracks (capped to 4 key pools for 60FPS performance)
+    if (isNight && f % 3 === 0) {
+      const stLight = new THREE.PointLight(0xeef2ff, 4.5, 290, 0.45);
+      stLight.position.set(p.x * 0.9, 34, p.z * 0.9);
+      group.add(stLight);
+    }
+  }
+  disposables.push(poleGeo, poleMat, headGeo, headMat);
+
+  // 8. NASCAR & NexPlay Perimeter Sponsor Billboards
+  const boardGeo = new THREE.BoxGeometry(18, 4.5, 0.6);
+  const boardTex1 = createBannerTexture('NEXPLAY · NASCAR CUP', '#E11D48', '#FFFFFF');
+  const boardTex2 = createBannerTexture('GOODYEAR · SUNOCO FUEL', '#0F172A', '#FACC15');
+  const boardMat1 = new THREE.MeshStandardMaterial({
+    map: boardTex1,
+    roughness: 0.5,
+    emissive: isNight ? 0x4c0519 : 0x000000,
+    emissiveIntensity: isNight ? 0.5 : 0,
+  });
+  const boardMat2 = new THREE.MeshStandardMaterial({
+    map: boardTex2,
+    roughness: 0.5,
+    emissive: isNight ? 0x1e293b : 0x000000,
+    emissiveIntensity: isNight ? 0.5 : 0,
+  });
+
+  [0.14, 0.28, 0.44, 0.62, 0.78, 0.92].forEach((sn, idx) => {
+    const smp = samples[Math.floor(sn * n) % n];
+    const yaw = Math.atan2(smp.tangent.x, smp.tangent.z);
+    const p = smp.position.clone().addScaledVector(smp.right, halfW + 2.6);
+    const board = new THREE.Mesh(boardGeo, idx % 2 === 0 ? boardMat1 : boardMat2);
+    board.position.set(p.x, p.y + 4.4, p.z);
+    board.rotation.y = yaw + Math.PI / 2;
+    group.add(board);
+  });
+  disposables.push(boardGeo, boardTex1, boardTex2, boardMat1, boardMat2);
+
+  const dispose = () => {
+    disposables.forEach((d) => d.dispose());
+  };
+
+  return {
+    group,
+    lightBulbs,
+    cameraFlashMesh,
+    cameraFlashPositions,
+    dispose,
+  };
+}

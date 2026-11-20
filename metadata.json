@@ -1,0 +1,6 @@
+{
+  "name": "NexPlay — Tecnología y Entretenimiento",
+  "description": "Ecosistema tecnológico y de entretenimiento chileno: Simulador Truck Aysén, soporte técnico, series, películas e innovación.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,1788 @@
+import * as THREE from 'three';
+import { TEAM_PRESETS } from '../data/cars';
+import { CircuitDefinition } from '../types/game';
+import {
+  createAsphaltTexture,
+  createBannerTexture,
+  createKerbTexture,
+  createPitEntryMarkingTexture,
+  createPitRoadTexture,
+  createStartLineTexture,
+} from './textures';
+
+export interface TrackSample {
+  point: THREE.Vector3;
+  tangent: THREE.Vector3;
+  right: THREE.Vector3;
+  t: number;
+}
+
+export interface BuiltTrack {
+  group: THREE.Group;
+  curve: THREE.CatmullRomCurve3;
+  samples: TrackSample[];
+  totalLength: number;
+  startLightMeshes: THREE.Mesh[];
+  startLightMats: THREE.MeshStandardMaterial[];
+  pitBox: {
+    position: THREE.Vector3;
+    heading: number;
+    sampleIndex: number;
+    lateralOffset: number;
+  };
+  pitRoadPoints: Array<{ x: number; z: number }>;
+  pitEntryIndex: number;
+  pitExitIndex: number;
+  closestPointOnTrack: (
+    x: number,
+    z: number,
+    hintIndex?: number
+  ) => {
+    sampleIndex: number;
+    t: number;
+    point: THREE.Vector3;
+    tangent: THREE.Vector3;
+    right: THREE.Vector3;
+    lateralOffset: number;
+    distSq: number;
+  };
+  setStartLights: (litCount: number) => void;
+  updateCrowd: (elapsedSec: number, pitActive?: boolean) => void;
+  dispose: () => void;
+}
+
+const _up = new THREE.Vector3(0, 1, 0);
+
+function hash2D(x: number, z: number): number {
+  const s = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+  return s - Math.floor(s);
+}
+
+function createCrowdFlagTexture(
+  topText: string,
+  bottomText: string,
+  bgHex: string,
+  accentHex: string
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 144;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.fillStyle = bgHex;
+  ctx.fillRect(0, 0, 256, 144);
+  ctx.fillStyle = accentHex;
+  ctx.fillRect(0, 0, 256, 22);
+  ctx.fillRect(0, 122, 256, 22);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 42px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(topText, 128, 56, 236);
+
+  ctx.fillStyle = '#FACC15';
+  ctx.font = 'bold 28px sans-serif';
+  ctx.fillText(bottomText, 128, 98, 236);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+export function buildTrackScene(
+  circuit: CircuitDefinition,
+  options: {
+    castShadow?: boolean;
+    maxAnisotropy?: number;
+    playerName?: string;
+    playerColor?: string;
+  } = {}
+): BuiltTrack {
+  const castShadow = options.castShadow ?? true;
+  const maxAniso = options.maxAnisotropy ?? 4;
+  const displayDriver = (options.playerName || 'PILOTO').trim().toUpperCase().slice(0, 14);
+  const teamAccent = options.playerColor || '#E11D48';
+
+  const group = new THREE.Group();
+  const disposables: Array<{ dispose: () => void }> = [];
+
+  const ctrlVecs = circuit.controlPoints.map(
+    ([x, y, z]) => new THREE.Vector3(x, y, z)
+  );
+  const curve = new THREE.CatmullRomCurve3(ctrlVecs, true, 'catmullrom', 0.45);
+  const totalLength = curve.getLength();
+
+  const SAMPLE_COUNT = 360;
+  const samples: TrackSample[] = [];
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    const t = i / SAMPLE_COUNT;
+    const point = curve.getPointAt(t);
+    const tangent = curve.getTangentAt(t).normalize();
+    const right = new THREE.Vector3().crossVectors(tangent, _up).normalize();
+    samples.push({ point, tangent, right, t });
+  }
+
+  const closestPointOnTrack = (x: number, z: number, hintIndex?: number) => {
+    let bestIdx = 0;
+    let bestDistSq = Infinity;
+
+    if (hintIndex !== undefined) {
+      for (let offset = -30; offset <= 30; offset++) {
+        const idx = (hintIndex + offset + SAMPLE_COUNT) % SAMPLE_COUNT;
+        const p = samples[idx].point;
+        const dx = x - p.x;
+        const dz = z - p.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestDistSq) {
+          bestDistSq = d2;
+          bestIdx = idx;
+        }
+      }
+    }
+
+    if (bestDistSq > 900 || hintIndex === undefined) {
+      for (let i = 0; i < SAMPLE_COUNT; i++) {
+        const p = samples[i].point;
+        const dx = x - p.x;
+        const dz = z - p.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < bestDistSq) {
+          bestDistSq = d2;
+          bestIdx = i;
+        }
+      }
+    }
+
+    const s = samples[bestIdx];
+    const dx = x - s.point.x;
+    const dz = z - s.point.z;
+    const lateralOffset = dx * s.right.x + dz * s.right.z;
+    const along = dx * s.tangent.x + dz * s.tangent.z;
+    const approxT = (s.t + along / totalLength + 1) % 1;
+
+    return {
+      sampleIndex: bestIdx,
+      t: approxT,
+      point: s.point,
+      tangent: s.tangent,
+      right: s.right,
+      lateralOffset,
+      distSq: bestDistSq,
+    };
+  };
+
+  const halfW = circuit.trackWidth * 0.5;
+  const roadVerts: number[] = [];
+  const roadUVs: number[] = [];
+  const roadIndices: number[] = [];
+
+  const kerbVerts: number[] = [];
+  const kerbUVs: number[] = [];
+  const kerbIndices: number[] = [];
+
+  const barrierVerts: number[] = [];
+  const barrierIndices: number[] = [];
+
+  for (let i = 0; i <= SAMPLE_COUNT; i++) {
+    const s = samples[i % SAMPLE_COUNT];
+    const vCoord = (i / SAMPLE_COUNT) * (totalLength / 14);
+
+    const leftX = s.point.x - s.right.x * halfW;
+    const leftZ = s.point.z - s.right.z * halfW;
+    const rightX = s.point.x + s.right.x * halfW;
+    const rightZ = s.point.z + s.right.z * halfW;
+
+    roadVerts.push(leftX, s.point.y, leftZ, rightX, s.point.y, rightZ);
+    roadUVs.push(0, vCoord, 1, vCoord);
+
+    const kerbW = 1.15;
+    const kV = (i / SAMPLE_COUNT) * (totalLength / 6);
+    const lKerbOutX = s.point.x - s.right.x * (halfW + kerbW);
+    const lKerbOutZ = s.point.z - s.right.z * (halfW + kerbW);
+    const rKerbOutX = s.point.x + s.right.x * (halfW + kerbW);
+    const rKerbOutZ = s.point.z + s.right.z * (halfW + kerbW);
+
+    kerbVerts.push(
+      lKerbOutX, s.point.y + 0.04, lKerbOutZ,
+      leftX, s.point.y + 0.02, leftZ,
+      rightX, s.point.y + 0.02, rightZ,
+      rKerbOutX, s.point.y + 0.04, rKerbOutZ
+    );
+    kerbUVs.push(0, kV, 1, kV, 0, kV, 1, kV);
+
+    let rightWallDist = halfW + 3.6;
+    if (i >= 149 && i <= 203) {
+      let wallFlare = 1;
+      if (i < 159) {
+        const k = (i - 149) / 10;
+        wallFlare = k * k * (3 - 2 * k);
+      } else if (i > 193) {
+        const k = (203 - i) / 10;
+        wallFlare = k * k * (3 - 2 * k);
+      }
+      rightWallDist = halfW + 3.6 + wallFlare * 10.4;
+    }
+    const leftWallDist = halfW + 3.6;
+    const lwX = s.point.x - s.right.x * leftWallDist;
+    const lwZ = s.point.z - s.right.z * leftWallDist;
+    const rwX = s.point.x + s.right.x * rightWallDist;
+    const rwZ = s.point.z + s.right.z * rightWallDist;
+
+    barrierVerts.push(
+      lwX, s.point.y - 0.2, lwZ,
+      lwX, s.point.y + 1.05, lwZ,
+      rwX, s.point.y - 0.2, rwZ,
+      rwX, s.point.y + 1.05, rwZ
+    );
+
+    if (i < SAMPLE_COUNT) {
+      const rBase = i * 2;
+      roadIndices.push(rBase, rBase + 2, rBase + 1, rBase + 1, rBase + 2, rBase + 3);
+
+      const kBase = i * 4;
+      kerbIndices.push(
+        kBase, kBase + 4, kBase + 1,
+        kBase + 1, kBase + 4, kBase + 5
+      );
+      const pitJunctionGap = (i >= 153 && i <= 164) || (i >= 187 && i <= 199);
+      if (!pitJunctionGap) {
+        kerbIndices.push(
+          kBase + 2, kBase + 6, kBase + 3,
+          kBase + 3, kBase + 6, kBase + 7
+        );
+      }
+
+      const bBase = i * 4;
+      barrierIndices.push(
+        bBase, bBase + 1, bBase + 4,
+        bBase + 1, bBase + 5, bBase + 4,
+        bBase + 2, bBase + 6, bBase + 3,
+        bBase + 3, bBase + 6, bBase + 7
+      );
+    }
+  }
+
+  const asphaltTex = createAsphaltTexture(maxAniso);
+  const kerbTex = createKerbTexture('#E11D48', '#F8FAFC', maxAniso);
+  disposables.push(asphaltTex, kerbTex);
+
+  const roadGeo = new THREE.BufferGeometry();
+  roadGeo.setAttribute('position', new THREE.Float32BufferAttribute(roadVerts, 3));
+  roadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(roadUVs, 2));
+  roadGeo.setIndex(roadIndices);
+  roadGeo.computeVertexNormals();
+
+  const roadMat = new THREE.MeshStandardMaterial({
+    map: asphaltTex,
+    roughness: 0.78,
+    metalness: 0.08,
+    side: THREE.DoubleSide,
+  });
+  const roadMesh = new THREE.Mesh(roadGeo, roadMat);
+  roadMesh.receiveShadow = true;
+  group.add(roadMesh);
+  disposables.push(roadGeo, roadMat);
+
+  const bedGeo = roadGeo.clone();
+  bedGeo.translate(0, -0.35, 0);
+  const bedMat = new THREE.MeshStandardMaterial({
+    color: 0x1e242c,
+    roughness: 0.9,
+    side: THREE.DoubleSide,
+  });
+  const bedMesh = new THREE.Mesh(bedGeo, bedMat);
+  group.add(bedMesh);
+  disposables.push(bedGeo, bedMat);
+
+  const kerbGeo = new THREE.BufferGeometry();
+  kerbGeo.setAttribute('position', new THREE.Float32BufferAttribute(kerbVerts, 3));
+  kerbGeo.setAttribute('uv', new THREE.Float32BufferAttribute(kerbUVs, 2));
+  kerbGeo.setIndex(kerbIndices);
+  kerbGeo.computeVertexNormals();
+
+  const kerbMat = new THREE.MeshStandardMaterial({
+    map: kerbTex,
+    roughness: 0.65,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+  });
+  const kerbMesh = new THREE.Mesh(kerbGeo, kerbMat);
+  kerbMesh.receiveShadow = true;
+  group.add(kerbMesh);
+  disposables.push(kerbGeo, kerbMat);
+
+  const barrierGeo = new THREE.BufferGeometry();
+  barrierGeo.setAttribute('position', new THREE.Float32BufferAttribute(barrierVerts, 3));
+  barrierGeo.setIndex(barrierIndices);
+  barrierGeo.computeVertexNormals();
+  const barrierMat = new THREE.MeshStandardMaterial({
+    color: circuit.environment.type === 'urban' ? 0xdbe2ea : 0x64748b,
+    roughness: 0.5,
+    metalness: 0.45,
+    side: THREE.DoubleSide,
+  });
+  const barrierMesh = new THREE.Mesh(barrierGeo, barrierMat);
+  barrierMesh.castShadow = castShadow;
+  barrierMesh.receiveShadow = true;
+  group.add(barrierMesh);
+  disposables.push(barrierGeo, barrierMat);
+
+  const startSample = samples[0];
+  const startHeading = Math.atan2(startSample.tangent.x, startSample.tangent.z);
+
+  const startLineTex = createStartLineTexture(maxAniso);
+  disposables.push(startLineTex);
+  const startLineMat = new THREE.MeshStandardMaterial({
+    map: startLineTex,
+    roughness: 0.7,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  const startLineMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(circuit.trackWidth * 0.94, 4.2),
+    startLineMat
+  );
+  startLineMesh.rotation.x = -Math.PI / 2;
+  startLineMesh.rotation.z = -startHeading;
+  startLineMesh.position.set(startSample.point.x, startSample.point.y + 0.03, startSample.point.z);
+  startLineMesh.receiveShadow = true;
+  group.add(startLineMesh);
+  disposables.push(startLineMesh.geometry, startLineMat);
+
+  const gantryGroup = new THREE.Group();
+  gantryGroup.position.copy(startSample.point);
+  gantryGroup.rotation.y = startHeading;
+
+  const gantryMetal = new THREE.MeshStandardMaterial({
+    color: 0x1e293b,
+    metalness: 0.75,
+    roughness: 0.3,
+  });
+  disposables.push(gantryMetal);
+
+  const pillarX = halfW + 1.4;
+  [-pillarX, pillarX].forEach((px) => {
+    const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.65, 8.2, 0.65), gantryMetal);
+    pillar.position.set(px, 4.1, 0);
+    pillar.castShadow = castShadow;
+    gantryGroup.add(pillar);
+  });
+
+  const crossbar = new THREE.Mesh(
+    new THREE.BoxGeometry(pillarX * 2 + 1.2, 1.35, 0.9),
+    gantryMetal
+  );
+  crossbar.position.set(0, 7.6, 0);
+  crossbar.castShadow = castShadow;
+  gantryGroup.add(crossbar);
+
+  const bannerTex = createBannerTexture(
+    `NEXPLAY · ${circuit.shortName.toUpperCase()}`,
+    '#090D12',
+    '#E11D48'
+  );
+  disposables.push(bannerTex);
+  const bannerMat = new THREE.MeshStandardMaterial({ map: bannerTex, roughness: 0.45 });
+  const bannerMesh = new THREE.Mesh(new THREE.PlaneGeometry(11.5, 1.15), bannerMat);
+  bannerMesh.position.set(0, 7.6, -0.47);
+  bannerMesh.rotation.y = Math.PI;
+  gantryGroup.add(bannerMesh);
+  const bannerFront = new THREE.Mesh(new THREE.PlaneGeometry(11.5, 1.15), bannerMat);
+  bannerFront.position.set(0, 7.6, 0.47);
+  gantryGroup.add(bannerFront);
+  disposables.push(bannerMesh.geometry, bannerMat);
+
+  const startLightMeshes: THREE.Mesh[] = [];
+  const startLightMats: THREE.MeshStandardMaterial[] = [];
+  for (let i = 0; i < 5; i++) {
+    const lx = (i - 2) * 1.45;
+    const pod = new THREE.Mesh(new THREE.BoxGeometry(0.95, 1.05, 0.6), gantryMetal);
+    pod.position.set(lx, 6.2, 0);
+    gantryGroup.add(pod);
+
+    const lMat = new THREE.MeshStandardMaterial({
+      color: 0x3f0a12,
+      emissive: 0xff1122,
+      emissiveIntensity: 0.05,
+      roughness: 0.2,
+    });
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 12), lMat);
+    bulb.position.set(lx, 6.2, -0.32);
+    gantryGroup.add(bulb);
+    startLightMeshes.push(bulb);
+    startLightMats.push(lMat);
+    disposables.push(lMat);
+  }
+  group.add(gantryGroup);
+
+  const pitEntryIndex = 154;
+  const pitSampleIdx = 175;
+  const pitExitIndex = 198;
+  const pitSample = samples[pitSampleIdx];
+  const pitHeading = Math.atan2(pitSample.tangent.x, pitSample.tangent.z);
+  const pitLat = halfW + 6.4;
+  const pitPos = new THREE.Vector3(
+    pitSample.point.x + pitSample.right.x * pitLat,
+    pitSample.point.y,
+    pitSample.point.z + pitSample.right.z * pitLat
+  );
+
+  const pitRoadPoints: Array<{ x: number; z: number }> = [];
+  const pitRoadVerts: number[] = [];
+  const pitRoadUVs: number[] = [];
+  const pitRoadIndices: number[] = [];
+  const pitLineVerts: number[] = [];
+  const pitLineIndices: number[] = [];
+  const pitOuterLineVerts: number[] = [];
+  const pitOuterLineIndices: number[] = [];
+  const pitLaneHalfW = 3.55;
+  const startLat = halfW - 1.3;
+
+  for (let i = pitEntryIndex; i <= pitExitIndex; i++) {
+    const s = samples[i % SAMPLE_COUNT];
+    const progress = (i - pitEntryIndex) / (pitExitIndex - pitEntryIndex);
+    let flare = 1;
+    if (progress < 0.23) {
+      const k = progress / 0.23;
+      flare = k * k * (3 - 2 * k);
+    } else if (progress > 0.77) {
+      const k = (1 - progress) / 0.23;
+      flare = k * k * (3 - 2 * k);
+    }
+
+    const centerLat = startLat + flare * (pitLat - startLat);
+    const cx = s.point.x + s.right.x * centerLat;
+    const cz = s.point.z + s.right.z * centerLat;
+    pitRoadPoints.push({ x: cx, z: cz });
+
+    const innerX = cx - s.right.x * pitLaneHalfW;
+    const innerZ = cz - s.right.z * pitLaneHalfW;
+    const outerX = cx + s.right.x * pitLaneHalfW;
+    const outerZ = cz + s.right.z * pitLaneHalfW;
+
+    const py = s.point.y + 0.038;
+    pitRoadVerts.push(innerX, py, innerZ, outerX, py, outerZ);
+    const vCoord = (i - pitEntryIndex) * 0.42;
+    pitRoadUVs.push(0, vCoord, 1, vCoord);
+
+    const ly = s.point.y + 0.056;
+    const innerEdge = centerLat - pitLaneHalfW + 0.22;
+    const outerEdge = centerLat + pitLaneHalfW - 0.22;
+    pitLineVerts.push(
+      s.point.x + s.right.x * (innerEdge - 0.14), ly, s.point.z + s.right.z * (innerEdge - 0.14),
+      s.point.x + s.right.x * (innerEdge + 0.14), ly, s.point.z + s.right.z * (innerEdge + 0.14)
+    );
+    pitOuterLineVerts.push(
+      s.point.x + s.right.x * (outerEdge - 0.16), ly, s.point.z + s.right.z * (outerEdge - 0.16),
+      s.point.x + s.right.x * (outerEdge + 0.16), ly, s.point.z + s.right.z * (outerEdge + 0.16)
+    );
+
+    if (i < pitExitIndex) {
+      const idx = (i - pitEntryIndex) * 2;
+      pitRoadIndices.push(idx, idx + 2, idx + 1, idx + 1, idx + 2, idx + 3);
+      pitLineIndices.push(idx, idx + 2, idx + 1, idx + 1, idx + 2, idx + 3);
+      pitOuterLineIndices.push(idx, idx + 2, idx + 1, idx + 1, idx + 2, idx + 3);
+    }
+  }
+
+  const pitRoadTex = createPitRoadTexture(maxAniso);
+  const pitRoadGeo = new THREE.BufferGeometry();
+  pitRoadGeo.setAttribute('position', new THREE.Float32BufferAttribute(pitRoadVerts, 3));
+  pitRoadGeo.setAttribute('uv', new THREE.Float32BufferAttribute(pitRoadUVs, 2));
+  pitRoadGeo.setIndex(pitRoadIndices);
+  pitRoadGeo.computeVertexNormals();
+  const pitRoadMat = new THREE.MeshStandardMaterial({
+    map: pitRoadTex,
+    color: 0xffffff,
+    roughness: 0.68,
+    metalness: 0.1,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  const pitRoadMesh = new THREE.Mesh(pitRoadGeo, pitRoadMat);
+  pitRoadMesh.receiveShadow = true;
+  group.add(pitRoadMesh);
+
+  const pitLineGeo = new THREE.BufferGeometry();
+  pitLineGeo.setAttribute('position', new THREE.Float32BufferAttribute(pitLineVerts, 3));
+  pitLineGeo.setIndex(pitLineIndices);
+  const pitLineMat = new THREE.MeshBasicMaterial({
+    color: 0xfacc15,
+    side: THREE.DoubleSide,
+  });
+  const pitLineMesh = new THREE.Mesh(pitLineGeo, pitLineMat);
+  group.add(pitLineMesh);
+
+  const pitOuterLineGeo = new THREE.BufferGeometry();
+  pitOuterLineGeo.setAttribute('position', new THREE.Float32BufferAttribute(pitOuterLineVerts, 3));
+  pitOuterLineGeo.setIndex(pitOuterLineIndices);
+  const pitOuterLineMesh = new THREE.Mesh(pitOuterLineGeo, pitLineMat);
+  group.add(pitOuterLineMesh);
+
+  const pitEntryMarkingTex = createPitEntryMarkingTexture(maxAniso);
+  const pitEntryMarkingMat = new THREE.MeshBasicMaterial({
+    map: pitEntryMarkingTex,
+    transparent: true,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+  });
+  const entryMarkGeo = new THREE.PlaneGeometry(5.2, 16);
+  const markSample = samples[pitEntryIndex - 2];
+  const markHeading = Math.atan2(markSample.tangent.x, markSample.tangent.z);
+  const entryMarkGroup = new THREE.Group();
+  entryMarkGroup.position.copy(markSample.point);
+  entryMarkGroup.rotation.y = markHeading;
+  const entryMarkMesh = new THREE.Mesh(entryMarkGeo, pitEntryMarkingMat);
+  entryMarkMesh.position.set(-(halfW - 2.3), 0.055, 0);
+  entryMarkMesh.rotation.x = -Math.PI / 2;
+  entryMarkMesh.rotation.z = Math.PI;
+  entryMarkGroup.add(entryMarkMesh);
+  group.add(entryMarkGroup);
+
+  const bollardPoleMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.5 });
+  const bollardGlowMat = new THREE.MeshBasicMaterial({ color: 0x4ade80 });
+  const bollardGeo = new THREE.CylinderGeometry(0.11, 0.14, 1.05, 8);
+  const bollardCapGeo = new THREE.CylinderGeometry(0.13, 0.13, 0.25, 8);
+  for (let i = pitEntryIndex; i <= pitEntryIndex + 12; i += 2) {
+    const s = samples[i % SAMPLE_COUNT];
+    const progress = (i - pitEntryIndex) / (pitExitIndex - pitEntryIndex);
+    const k = Math.min(1, progress / 0.23);
+    const flare = k * k * (3 - 2 * k);
+    const edgeLat = startLat + flare * (pitLat - startLat) + pitLaneHalfW + 0.38;
+    const bx = s.point.x + s.right.x * edgeLat;
+    const bz = s.point.z + s.right.z * edgeLat;
+    const pole = new THREE.Mesh(bollardGeo, bollardPoleMat);
+    pole.position.set(bx, s.point.y + 0.52, bz);
+    group.add(pole);
+    const cap = new THREE.Mesh(bollardCapGeo, bollardGlowMat);
+    cap.position.set(bx, s.point.y + 1.08, bz);
+    group.add(cap);
+  }
+
+  disposables.push(
+    pitRoadTex,
+    pitRoadGeo,
+    pitRoadMat,
+    pitLineGeo,
+    pitOuterLineGeo,
+    pitLineMat,
+    pitEntryMarkingTex,
+    pitEntryMarkingMat,
+    entryMarkGeo,
+    bollardPoleMat,
+    bollardGlowMat,
+    bollardGeo,
+    bollardCapGeo
+  );
+
+  const entrySample = samples[pitEntryIndex];
+  const entryHeading = Math.atan2(entrySample.tangent.x, entrySample.tangent.z);
+  const entryBannerTex = createCrowdFlagTexture(
+    'CALLE DE PITS',
+    'ENTRADA BOXES',
+    '#090D12',
+    '#FACC15'
+  );
+  const entryBannerMat = new THREE.MeshBasicMaterial({
+    map: entryBannerTex,
+    side: THREE.DoubleSide,
+  });
+  const entryArch = new THREE.Group();
+  entryArch.position.copy(entrySample.point);
+  entryArch.rotation.y = entryHeading;
+  const entryBoard = new THREE.Mesh(new THREE.PlaneGeometry(5.2, 1.35), entryBannerMat);
+  entryBoard.position.set(-(halfW + 4.4), 4.2, 0);
+  entryArch.add(entryBoard);
+  const entryPost = new THREE.Mesh(new THREE.BoxGeometry(0.3, 4.8, 0.3), gantryMetal);
+  entryPost.position.set(-(halfW + 7.1), 2.4, 0);
+  entryArch.add(entryPost);
+  group.add(entryArch);
+  disposables.push(entryBannerTex, entryBannerMat, entryBoard.geometry, entryPost.geometry);
+
+  const pitFenceMat = new THREE.MeshStandardMaterial({
+    color: 0xcbd5e1,
+    metalness: 0.72,
+    roughness: 0.35,
+  });
+  const pitWireMat = new THREE.MeshStandardMaterial({
+    color: 0x94a3b8,
+    metalness: 0.5,
+    roughness: 0.5,
+    transparent: true,
+    opacity: 0.42,
+    side: THREE.DoubleSide,
+  });
+  const pitWallBaseMat = new THREE.MeshStandardMaterial({
+    color: 0xe2e8f0,
+    roughness: 0.65,
+  });
+
+  const fencePostGeo = new THREE.BoxGeometry(0.14, 2.5, 0.14);
+  const fenceRailGeo = new THREE.BoxGeometry(0.09, 0.09, 1);
+  const fencePanelGeo = new THREE.PlaneGeometry(1, 1.55);
+  const wallSegGeo = new THREE.BoxGeometry(0.45, 0.92, 1);
+
+  for (let i = pitEntryIndex + 10; i < pitExitIndex - 10; i++) {
+    const sA = samples[i % SAMPLE_COUNT];
+    const sB = samples[(i + 1) % SAMPLE_COUNT];
+    const fenceLat = halfW + 2.15;
+    const ax = sA.point.x + sA.right.x * fenceLat;
+    const az = sA.point.z + sA.right.z * fenceLat;
+    const bx = sB.point.x + sB.right.x * fenceLat;
+    const bz = sB.point.z + sB.right.z * fenceLat;
+
+    const segLen = Math.hypot(bx - ax, bz - az);
+    const segYaw = Math.atan2(bx - ax, bz - az);
+    const mx = (ax + bx) * 0.5;
+    const my = (sA.point.y + sB.point.y) * 0.5;
+    const mz = (az + bz) * 0.5;
+
+    const wall = new THREE.Mesh(wallSegGeo, pitWallBaseMat);
+    wall.position.set(mx, my + 0.46, mz);
+    wall.rotation.y = segYaw;
+    wall.scale.set(1, 1, segLen + 0.12);
+    wall.castShadow = castShadow;
+    wall.receiveShadow = true;
+    group.add(wall);
+
+    const panel = new THREE.Mesh(fencePanelGeo, pitWireMat);
+    panel.position.set(mx, my + 1.7, mz);
+    panel.rotation.y = segYaw + Math.PI / 2;
+    panel.scale.set(segLen + 0.05, 1, 1);
+    group.add(panel);
+
+    const topRail = new THREE.Mesh(fenceRailGeo, pitFenceMat);
+    topRail.position.set(mx, my + 2.48, mz);
+    topRail.rotation.y = segYaw;
+    topRail.scale.set(1, 1, segLen + 0.1);
+    group.add(topRail);
+
+    const midRail = new THREE.Mesh(fenceRailGeo, pitFenceMat);
+    midRail.position.set(mx, my + 1.65, mz);
+    midRail.rotation.y = segYaw;
+    midRail.scale.set(1, 1, segLen + 0.1);
+    group.add(midRail);
+
+    if (i % 2 === 0) {
+      const post = new THREE.Mesh(fencePostGeo, pitFenceMat);
+      post.position.set(ax, sA.point.y + 1.25, az);
+      post.castShadow = castShadow;
+      group.add(post);
+    }
+
+    const outerLat = halfW + 13.7;
+    const oAx = sA.point.x + sA.right.x * outerLat;
+    const oAz = sA.point.z + sA.right.z * outerLat;
+    const oBx = sB.point.x + sB.right.x * outerLat;
+    const oBz = sB.point.z + sB.right.z * outerLat;
+    const oLen = Math.hypot(oBx - oAx, oBz - oAz);
+    const oYaw = Math.atan2(oBx - oAx, oBz - oAz);
+    const oMx = (oAx + oBx) * 0.5;
+    const oMz = (oAz + oBz) * 0.5;
+
+    const oRail = new THREE.Mesh(fenceRailGeo, pitFenceMat);
+    oRail.position.set(oMx, my + 2.2, oMz);
+    oRail.rotation.y = oYaw;
+    oRail.scale.set(1, 1, oLen + 0.1);
+    group.add(oRail);
+
+    const oPanel = new THREE.Mesh(fencePanelGeo, pitWireMat);
+    oPanel.position.set(oMx, my + 1.2, oMz);
+    oPanel.rotation.y = oYaw + Math.PI / 2;
+    oPanel.scale.set(oLen + 0.05, 1.35, 1);
+    group.add(oPanel);
+
+    if (i % 2 === 0) {
+      const oPost = new THREE.Mesh(fencePostGeo, pitFenceMat);
+      oPost.position.set(oAx, sA.point.y + 1.25, oAz);
+      group.add(oPost);
+    }
+  }
+  disposables.push(
+    pitFenceMat,
+    pitWireMat,
+    pitWallBaseMat,
+    fencePostGeo,
+    fenceRailGeo,
+    fencePanelGeo,
+    wallSegGeo
+  );
+
+  const pitGroup = new THREE.Group();
+  pitGroup.position.copy(pitSample.point);
+  pitGroup.rotation.y = pitHeading;
+
+  const pitApronMat = new THREE.MeshStandardMaterial({
+    color: 0x1a2029,
+    roughness: 0.72,
+    metalness: 0.1,
+  });
+  const pitApron = new THREE.Mesh(new THREE.BoxGeometry(9.2, 0.04, 38), pitApronMat);
+  pitApron.position.set(-(halfW + 6.6), 0.01, 0);
+  pitApron.receiveShadow = true;
+  pitGroup.add(pitApron);
+
+  const pitBoxLineMat = new THREE.MeshBasicMaterial({ color: 0x22c55e });
+  const pitBoxOutline = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 6.2), pitBoxLineMat);
+  pitBoxOutline.rotation.x = -Math.PI / 2;
+  pitBoxOutline.position.set(-pitLat, 0.06, 0);
+  pitGroup.add(pitBoxOutline);
+
+  const pitBoxInnerMat = new THREE.MeshBasicMaterial({ color: 0x0f172a });
+  const pitBoxInner = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 5.8), pitBoxInnerMat);
+  pitBoxInner.rotation.x = -Math.PI / 2;
+  pitBoxInner.position.set(-pitLat, 0.065, 0);
+  pitGroup.add(pitBoxInner);
+
+  const pitGarageMat = new THREE.MeshStandardMaterial({
+    color: 0x1e293b,
+    roughness: 0.58,
+    metalness: 0.3,
+  });
+  const pitHouseRoofMat = new THREE.MeshStandardMaterial({
+    color: 0x334155,
+    roughness: 0.45,
+    metalness: 0.5,
+  });
+  const pitBayInteriorMat = new THREE.MeshStandardMaterial({
+    color: 0x090d12,
+    roughness: 0.9,
+  });
+  const pitWindowGlowMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
+  const pitAccentMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(teamAccent),
+    roughness: 0.35,
+    metalness: 0.3,
+  });
+
+  const pitHouseSpecs: Array<{ sIdx: number; label: string; color: string; isPlayer: boolean }> = [
+    { sIdx: 163, label: 'CASA PITS · BOX 1', color: '#0284C7', isPlayer: false },
+    { sIdx: 169, label: 'CASA PITS · BOX 2', color: '#16A34A', isPlayer: false },
+    { sIdx: pitSampleIdx, label: `EQUIPO ${displayDriver}`, color: teamAccent, isPlayer: true },
+    { sIdx: 182, label: 'CASA PITS · MÉDICO', color: '#EA580C', isPlayer: false },
+  ];
+
+  const houseWallGeo = new THREE.BoxGeometry(4.4, 4.2, 11.5);
+  const houseRoofGeo = new THREE.ConeGeometry(4.4, 1.85, 4);
+  const houseBayGeo = new THREE.BoxGeometry(0.4, 3.1, 7.6);
+  const houseCanopyGeo = new THREE.BoxGeometry(3.8, 0.28, 12.0);
+  const houseWinGeo = new THREE.BoxGeometry(0.18, 0.85, 2.2);
+
+  pitHouseSpecs.forEach((spec) => {
+    const hs = samples[spec.sIdx];
+    const hYaw = Math.atan2(hs.tangent.x, hs.tangent.z);
+    const houseGroup = new THREE.Group();
+    houseGroup.position.set(
+      hs.point.x + hs.right.x * (halfW + 11.4),
+      hs.point.y,
+      hs.point.z + hs.right.z * (halfW + 11.4)
+    );
+    houseGroup.rotation.y = hYaw;
+
+    const walls = new THREE.Mesh(houseWallGeo, pitGarageMat);
+    walls.position.set(0, 2.1, 0);
+    walls.castShadow = castShadow;
+    walls.receiveShadow = true;
+    houseGroup.add(walls);
+
+    const roof = new THREE.Mesh(houseRoofGeo, pitHouseRoofMat);
+    roof.position.set(0, 5.1, 0);
+    roof.rotation.y = Math.PI / 4;
+    roof.scale.set(1.0, 1.0, 2.2);
+    roof.castShadow = castShadow;
+    houseGroup.add(roof);
+
+    const bay = new THREE.Mesh(houseBayGeo, pitBayInteriorMat);
+    bay.position.set(2.05, 1.55, 0);
+    houseGroup.add(bay);
+
+    const bayLight = new THREE.Mesh(
+      new THREE.BoxGeometry(0.16, 0.16, 6.2),
+      pitWindowGlowMat
+    );
+    bayLight.position.set(2.0, 3.05, 0);
+    houseGroup.add(bayLight);
+
+    [-3.6, 3.6].forEach((wz) => {
+      const win = new THREE.Mesh(houseWinGeo, pitWindowGlowMat);
+      win.position.set(2.22, 3.55, wz);
+      houseGroup.add(win);
+    });
+
+    const trimMat = spec.isPlayer
+      ? pitAccentMat
+      : new THREE.MeshStandardMaterial({
+          color: new THREE.Color(spec.color),
+          roughness: 0.35,
+          metalness: 0.3,
+        });
+    if (!spec.isPlayer) disposables.push(trimMat);
+
+    const canopy = new THREE.Mesh(houseCanopyGeo, trimMat);
+    canopy.position.set(3.4, 3.7, 0);
+    canopy.castShadow = castShadow;
+    houseGroup.add(canopy);
+
+    const hSignTex = createCrowdFlagTexture(
+      spec.isPlayer ? 'CALLE DE PITS' : 'CASA DE PITS',
+      spec.label,
+      '#090D12',
+      spec.color
+    );
+    const hSignMat = new THREE.MeshBasicMaterial({ map: hSignTex });
+    const hSign = new THREE.Mesh(new THREE.PlaneGeometry(10.5, 1.35), hSignMat);
+    hSign.position.set(5.32, 3.7, 0);
+    hSign.rotation.y = Math.PI / 2;
+    houseGroup.add(hSign);
+
+    group.add(houseGroup);
+    disposables.push(bayLight.geometry, hSignTex, hSignMat, hSign.geometry);
+  });
+
+  const crewSuitMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(teamAccent),
+    roughness: 0.6,
+  });
+  const crewHelmetMat = new THREE.MeshStandardMaterial({
+    color: 0xf8fafc,
+    roughness: 0.25,
+    metalness: 0.5,
+  });
+  const spareTireMat = new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.85 });
+  const spareRimMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.6, roughness: 0.3 });
+  const spareWingMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(teamAccent),
+    roughness: 0.35,
+    metalness: 0.4,
+  });
+  const gunMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, metalness: 0.6, roughness: 0.3 });
+
+  const pitCrewMechanics: Array<{
+    group: THREE.Group;
+    phase: number;
+    baseX: number;
+    sideSign: number;
+    role: 'wheel' | 'bumper' | 'gun';
+  }> = [];
+  const crewSpecs: Array<[number, number, 'wheel' | 'bumper' | 'gun']> = [
+    [-pitLat - 1.9, 1.9, 'wheel'],
+    [-pitLat - 1.9, -1.9, 'wheel'],
+    [-pitLat + 1.8, 1.9, 'wheel'],
+    [-pitLat + 1.8, -1.9, 'wheel'],
+    [-pitLat - 0.3, 3.6, 'bumper'],
+    [-pitLat + 0.5, 3.6, 'gun'],
+    [-pitLat - 2.3, 0.2, 'gun'],
+    [-pitLat - 2.3, -0.8, 'gun'],
+  ];
+
+  const crewBodyGeo = new THREE.CylinderGeometry(0.24, 0.28, 1.15, 8);
+  const crewHelmGeo = new THREE.SphereGeometry(0.21, 10, 10);
+  const crewVisorGeo = new THREE.BoxGeometry(0.26, 0.1, 0.16);
+  const spareTireGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 12);
+  spareTireGeo.rotateZ(Math.PI / 2);
+  const spareRimGeo = new THREE.CylinderGeometry(0.19, 0.19, 0.3, 10);
+  spareRimGeo.rotateZ(Math.PI / 2);
+  const spareBumperGeo = new THREE.BoxGeometry(1.75, 0.14, 0.48);
+  const gunGeo = new THREE.BoxGeometry(0.35, 0.12, 0.14);
+
+  crewSpecs.forEach(([cx, cz, role], idx) => {
+    const mGroup = new THREE.Group();
+    mGroup.position.set(cx, 0, cz);
+    const sideSign = cx < -pitLat ? 1 : -1;
+
+    const body = new THREE.Mesh(crewBodyGeo, crewSuitMat);
+    body.position.set(0, 0.6, 0);
+    body.castShadow = castShadow;
+    mGroup.add(body);
+
+    const helm = new THREE.Mesh(crewHelmGeo, crewHelmetMat);
+    helm.position.set(0, 1.32, 0);
+    mGroup.add(helm);
+
+    const visor = new THREE.Mesh(crewVisorGeo, pitBayInteriorMat);
+    visor.position.set(sideSign * 0.14, 1.33, 0);
+    mGroup.add(visor);
+
+    if (role === 'wheel') {
+      const tire = new THREE.Mesh(spareTireGeo, spareTireMat);
+      tire.position.set(sideSign * 0.45, 0.45, 0);
+      mGroup.add(tire);
+      const rim = new THREE.Mesh(spareRimGeo, spareRimMat);
+      rim.position.copy(tire.position);
+      mGroup.add(rim);
+      const gun = new THREE.Mesh(gunGeo, gunMat);
+      gun.position.set(sideSign * 0.35, 0.78, 0.24);
+      mGroup.add(gun);
+    } else if (role === 'bumper') {
+      const wing = new THREE.Mesh(spareBumperGeo, spareWingMat);
+      wing.position.set(0.25, 0.72, -0.45);
+      mGroup.add(wing);
+    } else {
+      const gun = new THREE.Mesh(gunGeo, gunMat);
+      gun.position.set(sideSign * 0.34, 0.85, 0);
+      mGroup.add(gun);
+    }
+
+    pitGroup.add(mGroup);
+    pitCrewMechanics.push({ group: mGroup, phase: idx * 0.9, baseX: cx, sideSign, role });
+  });
+
+  for (let sIdx = 0; sIdx < 4; sIdx++) {
+    const tStack = new THREE.Mesh(spareTireGeo, spareTireMat);
+    tStack.rotation.z = Math.PI / 2;
+    tStack.position.set(-(halfW + 9.1), 0.18 + sIdx * 0.28, -4.5);
+    pitGroup.add(tStack);
+  }
+
+  group.add(pitGroup);
+  disposables.push(
+    pitApron.geometry,
+    pitApronMat,
+    pitBoxOutline.geometry,
+    pitBoxLineMat,
+    pitBoxInner.geometry,
+    pitBoxInnerMat,
+    pitGarageMat,
+    pitHouseRoofMat,
+    pitBayInteriorMat,
+    pitWindowGlowMat,
+    pitAccentMat,
+    houseWallGeo,
+    houseRoofGeo,
+    houseBayGeo,
+    houseCanopyGeo,
+    houseWinGeo,
+    crewSuitMat,
+    crewHelmetMat,
+    spareTireMat,
+    spareRimMat,
+    spareWingMat,
+    gunMat,
+    crewBodyGeo,
+    crewHelmGeo,
+    crewVisorGeo,
+    spareTireGeo,
+    spareRimGeo,
+    spareBumperGeo,
+    gunGeo
+  );
+
+  const emergencyBeacons: Array<{ blueMat: THREE.MeshBasicMaterial; redMat: THREE.MeshBasicMaterial; phase: number }> = [];
+
+  const policeGreenMat = new THREE.MeshStandardMaterial({ color: 0x14532d, roughness: 0.4, metalness: 0.25 });
+  const policeWhiteMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.35, metalness: 0.2 });
+  const darkTrimMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.6, metalness: 0.4 });
+  const cabGlassMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.15, metalness: 0.85 });
+  const vestNeonMat = new THREE.MeshStandardMaterial({ color: 0xa3e635, roughness: 0.55 });
+  const ambRedMat = new THREE.MeshStandardMaterial({ color: 0xdc2626, roughness: 0.35, metalness: 0.2 });
+  const paramedicNavyMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, roughness: 0.65 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: 0xe2b89b, roughness: 0.8 });
+
+  const polLabelTex = createCrowdFlagTexture('CARABINEROS', 'DE CHILE', '#14532D', '#F8FAFC');
+  const polLabelMat = new THREE.MeshBasicMaterial({ map: polLabelTex, side: THREE.DoubleSide });
+  const ambLabelTex = createCrowdFlagTexture('AMBULANCIA', 'EMERGENCIA SAMU', '#F8FAFC', '#DC2626');
+  const ambLabelMat = new THREE.MeshBasicMaterial({ map: ambLabelTex, side: THREE.DoubleSide });
+
+  const emergWheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.26, 12);
+  emergWheelGeo.rotateZ(Math.PI / 2);
+
+  disposables.push(
+    policeGreenMat,
+    policeWhiteMat,
+    darkTrimMat,
+    cabGlassMat,
+    vestNeonMat,
+    ambRedMat,
+    paramedicNavyMat,
+    skinMat,
+    polLabelTex,
+    polLabelMat,
+    ambLabelTex,
+    ambLabelMat,
+    emergWheelGeo
+  );
+
+  const carabineroSpots: Array<{ sIdx: number; side: number }> = [
+    { sIdx: 48, side: 1 },
+    { sIdx: 144, side: -1 },
+    { sIdx: 252, side: 1 },
+  ];
+
+  carabineroSpots.forEach(({ sIdx, side }, spotIdx) => {
+    const s = samples[sIdx % SAMPLE_COUNT];
+    const dist = halfW + 7.6;
+    const pGroup = new THREE.Group();
+    pGroup.position.set(
+      s.point.x + s.right.x * side * dist,
+      s.point.y,
+      s.point.z + s.right.z * side * dist
+    );
+    pGroup.rotation.y = Math.atan2(s.tangent.x, s.tangent.z);
+
+    const car = new THREE.Group();
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(1.92, 0.68, 4.45), policeGreenMat);
+    hull.position.set(0, 0.56, 0);
+    hull.castShadow = castShadow;
+    car.add(hull);
+
+    const doorPanel = new THREE.Mesh(new THREE.BoxGeometry(1.96, 0.52, 2.05), policeWhiteMat);
+    doorPanel.position.set(0, 0.62, 0);
+    car.add(doorPanel);
+
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(1.52, 0.52, 2.15), policeWhiteMat);
+    roof.position.set(0, 1.14, -0.1);
+    car.add(roof);
+
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(1.56, 0.42, 1.98), cabGlassMat);
+    glass.position.set(0, 1.12, -0.1);
+    car.add(glass);
+
+    const hoodSign = new THREE.Mesh(new THREE.PlaneGeometry(1.65, 0.45), polLabelMat);
+    hoodSign.position.set(-side * 0.99, 0.64, 0);
+    hoodSign.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2;
+    car.add(hoodSign);
+
+    [
+      [-0.95, 0.36, 1.38],
+      [0.95, 0.36, 1.38],
+      [-0.95, 0.36, -1.38],
+      [0.95, 0.36, -1.38],
+    ].forEach(([wx, wy, wz]) => {
+      const w = new THREE.Mesh(emergWheelGeo, darkTrimMat);
+      w.position.set(wx, wy, wz);
+      car.add(w);
+    });
+
+    const blueMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
+    const redMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+    const bBar = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.14, 0.28), darkTrimMat);
+    bBar.position.set(0, 1.44, -0.1);
+    const lBeacon = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.15, 0.24), blueMat);
+    lBeacon.position.set(-0.28, 1.48, -0.1);
+    const rBeacon = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.15, 0.24), redMat);
+    rBeacon.position.set(0.28, 1.48, -0.1);
+    car.add(bBar, lBeacon, rBeacon);
+    emergencyBeacons.push({ blueMat, redMat, phase: spotIdx * 1.3 });
+    pGroup.add(car);
+
+    [-1.7, 1.7].forEach((oz) => {
+      const officer = new THREE.Group();
+      officer.position.set(-side * 1.55, 0, oz);
+
+      const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.24, 0.72, 8), policeGreenMat);
+      legs.position.set(0, 0.36, 0);
+      officer.add(legs);
+      const vest = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.22, 0.56, 8), vestNeonMat);
+      vest.position.set(0, 0.96, 0);
+      officer.add(vest);
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 10), skinMat);
+      head.position.set(0, 1.38, 0);
+      officer.add(head);
+      const kepi = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.17, 0.13, 10), policeGreenMat);
+      kepi.position.set(0, 1.52, 0);
+      officer.add(kepi);
+
+      pGroup.add(officer);
+      disposables.push(legs.geometry, vest.geometry, head.geometry, kepi.geometry);
+    });
+
+    group.add(pGroup);
+    disposables.push(
+      hull.geometry,
+      doorPanel.geometry,
+      roof.geometry,
+      glass.geometry,
+      hoodSign.geometry,
+      bBar.geometry,
+      lBeacon.geometry,
+      rBeacon.geometry,
+      blueMat,
+      redMat
+    );
+  });
+
+  const ambulanceSpots: Array<{ sIdx: number; side: number }> = [
+    { sIdx: 108, side: 1 },
+    { sIdx: 304, side: -1 },
+  ];
+
+  ambulanceSpots.forEach(({ sIdx, side }, spotIdx) => {
+    const s = samples[sIdx % SAMPLE_COUNT];
+    const dist = halfW + 7.9;
+    const aGroup = new THREE.Group();
+    aGroup.position.set(
+      s.point.x + s.right.x * side * dist,
+      s.point.y,
+      s.point.z + s.right.z * side * dist
+    );
+    aGroup.rotation.y = Math.atan2(s.tangent.x, s.tangent.z);
+
+    const amb = new THREE.Group();
+    const boxBody = new THREE.Mesh(new THREE.BoxGeometry(2.15, 1.75, 3.8), policeWhiteMat);
+    boxBody.position.set(0, 1.25, -0.75);
+    boxBody.castShadow = castShadow;
+    amb.add(boxBody);
+
+    const cab = new THREE.Mesh(new THREE.BoxGeometry(2.02, 1.32, 1.65), policeWhiteMat);
+    cab.position.set(0, 1.02, 1.85);
+    cab.castShadow = castShadow;
+    amb.add(cab);
+
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.24, 5.15), ambRedMat);
+    stripe.position.set(0, 0.72, 0.08);
+    amb.add(stripe);
+
+    const windshield = new THREE.Mesh(new THREE.BoxGeometry(1.78, 0.68, 0.14), cabGlassMat);
+    windshield.position.set(0, 1.32, 2.66);
+    amb.add(windshield);
+
+    const sideSign = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 0.8), ambLabelMat);
+    sideSign.position.set(-side * 1.1, 1.4, -0.65);
+    sideSign.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2;
+    amb.add(sideSign);
+
+    [
+      [-1.02, 0.36, 1.85],
+      [1.02, 0.36, 1.85],
+      [-1.02, 0.36, -1.85],
+      [1.02, 0.36, -1.85],
+    ].forEach(([wx, wy, wz]) => {
+      const w = new THREE.Mesh(emergWheelGeo, darkTrimMat);
+      w.position.set(wx, wy, wz);
+      amb.add(w);
+    });
+
+    const blueMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
+    const redMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+    const lBeacon = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.18, 0.3), redMat);
+    lBeacon.position.set(-0.55, 2.22, 0.95);
+    const rBeacon = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.18, 0.3), blueMat);
+    rBeacon.position.set(0.55, 2.22, 0.95);
+    amb.add(lBeacon, rBeacon);
+    emergencyBeacons.push({ blueMat, redMat, phase: spotIdx * 1.7 + 0.5 });
+    aGroup.add(amb);
+
+    [-1.1, 1.1].forEach((pz) => {
+      const medic = new THREE.Group();
+      medic.position.set(-side * 1.65, 0, pz);
+
+      const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.24, 0.7, 8), paramedicNavyMat);
+      legs.position.set(0, 0.35, 0);
+      medic.add(legs);
+      const jacket = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.22, 0.56, 8), ambRedMat);
+      jacket.position.set(0, 0.95, 0);
+      medic.add(jacket);
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 10), skinMat);
+      head.position.set(0, 1.38, 0);
+      medic.add(head);
+      const helm = new THREE.Mesh(new THREE.SphereGeometry(0.19, 10, 8, 0, Math.PI * 2, 0, Math.PI * 0.55), policeWhiteMat);
+      helm.position.set(0, 1.4, 0);
+      medic.add(helm);
+
+      aGroup.add(medic);
+      disposables.push(legs.geometry, jacket.geometry, head.geometry, helm.geometry);
+    });
+
+    group.add(aGroup);
+    disposables.push(
+      boxBody.geometry,
+      cab.geometry,
+      stripe.geometry,
+      windshield.geometry,
+      sideSign.geometry,
+      lBeacon.geometry,
+      rBeacon.geometry,
+      blueMat,
+      redMat
+    );
+  });
+
+  const terrainSize = 1500;
+  const terrainSegs = 96;
+  const terrainGeo = new THREE.PlaneGeometry(
+    terrainSize,
+    terrainSize,
+    terrainSegs,
+    terrainSegs
+  );
+  terrainGeo.rotateX(-Math.PI / 2);
+
+  const posAttr = terrainGeo.attributes.position;
+  const colors = new Float32Array(posAttr.count * 3);
+  const baseGround = new THREE.Color(circuit.environment.groundColor);
+  const rockColor = new THREE.Color(circuit.environment.mountainColor);
+  const snowColor = new THREE.Color('#EDF4FA');
+  const tmpColor = new THREE.Color();
+
+  for (let i = 0; i < posAttr.count; i++) {
+    const vx = posAttr.getX(i);
+    const vz = posAttr.getZ(i);
+
+    let minD2 = Infinity;
+    let nearestY = 0;
+    for (let sIdx = 0; sIdx < SAMPLE_COUNT; sIdx += 3) {
+      const sp = samples[sIdx].point;
+      const dx = vx - sp.x;
+      const dz = vz - sp.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < minD2) {
+        minD2 = d2;
+        nearestY = sp.y;
+      }
+    }
+    const dist = Math.sqrt(minD2);
+
+    let y = nearestY - 0.55;
+    if (dist > halfW + 5) {
+      const excess = dist - (halfW + 5);
+      const ridge1 = Math.sin(vx * 0.011 + 1.2) * Math.cos(vz * 0.011 - 0.5);
+      const ridge2 = Math.abs(Math.sin(vx * 0.023 - vz * 0.018));
+      const mtnScale =
+        circuit.environment.type === 'mountain'
+          ? 1.55
+          : circuit.environment.type === 'urban' || circuit.environment.type === 'night'
+            ? 0.85
+            : 1.05;
+      const ramp = Math.min(1, excess / 95);
+      const mountainH =
+        ramp * ramp * (38 + ridge1 * 28 + ridge2 * 46) * mtnScale;
+      y = nearestY - 0.4 + mountainH;
+
+      if (
+        (circuit.environment.type === 'lake' ||
+          circuit.environment.type === 'river') &&
+        vx > -90 &&
+        vx < 140 &&
+        vz > -120 &&
+        vz < 120
+      ) {
+        y = Math.min(y, (circuit.environment.waterLevel ?? -1.8) - 1.5);
+      }
+    }
+
+    posAttr.setY(i, y);
+
+    if (y > circuit.environment.snowLineY) {
+      const snowBlend = Math.min(1, (y - circuit.environment.snowLineY) / 14);
+      tmpColor.copy(rockColor).lerp(snowColor, snowBlend);
+    } else if (y > 12) {
+      const rockBlend = Math.min(1, (y - 12) / 18);
+      tmpColor.copy(baseGround).lerp(rockColor, rockBlend);
+    } else {
+      const n = (hash2D(vx * 0.1, vz * 0.1) - 0.5) * 0.06;
+      tmpColor.copy(baseGround).offsetHSL(0, 0, n);
+    }
+    colors[i * 3] = tmpColor.r;
+    colors[i * 3 + 1] = tmpColor.g;
+    colors[i * 3 + 2] = tmpColor.b;
+  }
+
+  terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  terrainGeo.computeVertexNormals();
+
+  const terrainMat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.92,
+    metalness: 0.02,
+  });
+  const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
+  terrainMesh.receiveShadow = true;
+  group.add(terrainMesh);
+  disposables.push(terrainGeo, terrainMat);
+
+  if (circuit.environment.waterColor) {
+    const waterGeo = new THREE.PlaneGeometry(1400, 1400);
+    waterGeo.rotateX(-Math.PI / 2);
+    const waterMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(circuit.environment.waterColor),
+      roughness: 0.14,
+      metalness: 0.25,
+      clearcoat: 1.0,
+      clearcoatRoughness: 0.08,
+    });
+    const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+    waterMesh.position.y = circuit.environment.waterLevel ?? -1.8;
+    waterMesh.receiveShadow = true;
+    group.add(waterMesh);
+    disposables.push(waterGeo, waterMat);
+  }
+
+  const standBaseMat = new THREE.MeshStandardMaterial({
+    color: 0x1e293b,
+    roughness: 0.7,
+    metalness: 0.25,
+  });
+  const standRoofMat = new THREE.MeshStandardMaterial({
+    color: 0x0f172a,
+    roughness: 0.5,
+    metalness: 0.5,
+  });
+  disposables.push(standBaseMat, standRoofMat);
+
+  const standIndices = [6, 30, 88, 134, 215, 285, 336];
+  const crowdCoords: Array<{ x: number; y: number; z: number; heading: number; teamIdx: number }> = [];
+
+  standIndices.forEach((sIdx, stIdx) => {
+    const s = samples[sIdx % SAMPLE_COUNT];
+    const side = stIdx % 2 === 0 ? -1 : 1;
+    const dist = halfW + 10.5;
+    const sx = s.point.x + s.right.x * side * dist;
+    const sz = s.point.z + s.right.z * side * dist;
+    const yaw = Math.atan2(s.tangent.x, s.tangent.z);
+
+    const standGroup = new THREE.Group();
+    standGroup.position.set(sx, s.point.y, sz);
+    standGroup.rotation.y = yaw;
+
+    for (let tier = 0; tier < 3; tier++) {
+      const step = new THREE.Mesh(
+        new THREE.BoxGeometry(2.6, 1.3 + tier * 1.1, 26),
+        standBaseMat
+      );
+      step.position.set(side * (tier * 2.2), (1.3 + tier * 1.1) * 0.5 - 0.2, 0);
+      step.castShadow = castShadow;
+      step.receiveShadow = true;
+      standGroup.add(step);
+      disposables.push(step.geometry);
+
+      for (let zOff = -11.5; zOff <= 11.5; zOff += 1.65) {
+        const localPos = new THREE.Vector3(side * (tier * 2.2), 1.3 + tier * 1.1 - 0.15, zOff);
+        localPos.applyAxisAngle(_up, yaw);
+        crowdCoords.push({
+          x: sx + localPos.x,
+          y: s.point.y + localPos.y,
+          z: sz + localPos.z,
+          heading: yaw + (side > 0 ? Math.PI : 0),
+          teamIdx: Math.floor(hash2D(stIdx + zOff, tier) * TEAM_PRESETS.length),
+        });
+      }
+    }
+
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(7.8, 0.35, 27), standRoofMat);
+    roof.position.set(side * 2.5, 6.4, 0);
+    roof.rotation.z = side * -0.12;
+    standGroup.add(roof);
+    disposables.push(roof.geometry);
+
+    group.add(standGroup);
+  });
+
+  for (let i = 0; i < SAMPLE_COUNT; i += 2) {
+    const s = samples[i];
+    const side = i % 4 === 0 ? 1 : -1;
+    if (side === 1 && i >= 150 && i <= 202) continue;
+    const dist = halfW + 5.6 + (hash2D(i, 3.1) * 3.2);
+    crowdCoords.push({
+      x: s.point.x + s.right.x * side * dist,
+      y: s.point.y - 0.15,
+      z: s.point.z + s.right.z * side * dist,
+      heading: Math.atan2(s.tangent.x, s.tangent.z) + (side > 0 ? Math.PI : 0),
+      teamIdx: i % TEAM_PRESETS.length,
+    });
+  }
+
+  const crowdCount = crowdCoords.length;
+  const fanUniformTime = { value: 0 };
+
+  const torsoGeo = new THREE.CylinderGeometry(0.24, 0.28, 0.95, 7);
+  torsoGeo.translate(0, 0.48, 0);
+  const headGeo = new THREE.SphereGeometry(0.18, 8, 8);
+  headGeo.translate(0, 1.12, 0);
+  const flagGeo = new THREE.BoxGeometry(0.06, 0.65, 0.52);
+  flagGeo.translate(0.32, 1.45, 0);
+
+  const attachCheerWave = (mat: THREE.MeshStandardMaterial) => {
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = fanUniformTime;
+      shader.vertexShader =
+        'uniform float uTime;\n' +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+           float cheerPhase = float(gl_InstanceID) * 1.73;
+           transformed.y += max(0.0, sin(uTime * 6.5 + cheerPhase)) * 0.24;`
+        );
+    };
+    return mat;
+  };
+
+  const torsoMat = attachCheerWave(
+    new THREE.MeshStandardMaterial({ roughness: 0.75, metalness: 0.05 })
+  );
+  const headMat = attachCheerWave(
+    new THREE.MeshStandardMaterial({ color: 0xe2b89b, roughness: 0.8 })
+  );
+  const flagMat = attachCheerWave(
+    new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.1 })
+  );
+
+  const torsoInst = new THREE.InstancedMesh(torsoGeo, torsoMat, crowdCount);
+  const headInst = new THREE.InstancedMesh(headGeo, headMat, crowdCount);
+  const flagInst = new THREE.InstancedMesh(flagGeo, flagMat, crowdCount);
+
+  const dummy = new THREE.Object3D();
+  const cColor = new THREE.Color();
+
+  for (let i = 0; i < crowdCount; i++) {
+    const c = crowdCoords[i];
+    const scale = 0.88 + hash2D(i, 19.7) * 0.24;
+    dummy.position.set(c.x, c.y, c.z);
+    dummy.rotation.set(0, c.heading, 0);
+    dummy.scale.setScalar(scale);
+    dummy.updateMatrix();
+
+    torsoInst.setMatrixAt(i, dummy.matrix);
+    headInst.setMatrixAt(i, dummy.matrix);
+    flagInst.setMatrixAt(i, dummy.matrix);
+
+    const team = TEAM_PRESETS[c.teamIdx % TEAM_PRESETS.length];
+    cColor.set(team.primaryColor);
+    torsoInst.setColorAt(i, cColor);
+    flagInst.setColorAt(i, cColor);
+  }
+  torsoInst.computeBoundingSphere();
+  headInst.computeBoundingSphere();
+  flagInst.computeBoundingSphere();
+  group.add(torsoInst, headInst, flagInst);
+  disposables.push(torsoGeo, torsoMat, headGeo, headMat, flagGeo, flagMat);
+
+  const fanBannerTexA = createCrowdFlagTexture(
+    `F1 · ${displayDriver}`,
+    '¡DALE PATAGONIA!',
+    '#0F172A',
+    teamAccent
+  );
+  const fanBannerTexB = createCrowdFlagTexture(
+    'F1 AYSÉN',
+    `VAMOS ${displayDriver}`,
+    '#991B1B',
+    '#F8FAFC'
+  );
+  const fanBannerMatA = new THREE.MeshStandardMaterial({
+    map: fanBannerTexA,
+    side: THREE.DoubleSide,
+    roughness: 0.55,
+  });
+  const fanBannerMatB = new THREE.MeshStandardMaterial({
+    map: fanBannerTexB,
+    side: THREE.DoubleSide,
+    roughness: 0.55,
+  });
+  const fanPoleMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, metalness: 0.5 });
+  const fanFlagGeo = new THREE.PlaneGeometry(1.45, 0.85);
+  const fanPoleGeo = new THREE.CylinderGeometry(0.03, 0.03, 2.2, 6);
+  const wavingBanners: Array<{ group: THREE.Group; phase: number; baseY: number }> = [];
+
+  for (let i = 0; i < 32; i++) {
+    const sIdx = Math.floor((i / 32) * SAMPLE_COUNT) % SAMPLE_COUNT;
+    const s = samples[sIdx];
+    const side = i % 2 === 0 ? -1 : 1;
+    if (side === 1 && sIdx >= 150 && sIdx <= 202) continue;
+    const dist = halfW + 5.2 + (i % 3) * 1.4;
+    const bx = s.point.x + s.right.x * side * dist;
+    const bz = s.point.z + s.right.z * side * dist;
+    const bHeading = Math.atan2(s.tangent.x, s.tangent.z) + (side > 0 ? Math.PI : 0);
+
+    const bGroup = new THREE.Group();
+    const baseY = s.point.y + 0.1;
+    bGroup.position.set(bx, baseY, bz);
+    bGroup.rotation.y = bHeading;
+
+    const pole = new THREE.Mesh(fanPoleGeo, fanPoleMat);
+    pole.position.set(0.35, 1.4, 0);
+    bGroup.add(pole);
+
+    const cloth = new THREE.Mesh(fanFlagGeo, i % 2 === 0 ? fanBannerMatA : fanBannerMatB);
+    cloth.position.set(0.35, 2.15, 0.72);
+    cloth.rotation.y = Math.PI / 2;
+    bGroup.add(cloth);
+
+    group.add(bGroup);
+    wavingBanners.push({ group: bGroup, phase: i * 1.17, baseY });
+  }
+  disposables.push(
+    fanBannerTexA,
+    fanBannerTexB,
+    fanBannerMatA,
+    fanBannerMatB,
+    fanPoleMat,
+    fanFlagGeo,
+    fanPoleGeo
+  );
+
+  if (circuit.environment.type !== 'desert') {
+    const treeCount = 220;
+    const trunkGeo = new THREE.CylinderGeometry(0.26, 0.42, 3.2, 6);
+    trunkGeo.translate(0, 1.6, 0);
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3525, roughness: 0.9 });
+
+    const crown1Geo = new THREE.ConeGeometry(2.3, 6.2, 7);
+    crown1Geo.translate(0, 5.2, 0);
+    const crown1Mat = new THREE.MeshStandardMaterial({ color: 0x1e4631, roughness: 0.85 });
+
+    const crown2Geo = new THREE.ConeGeometry(1.6, 4.6, 7);
+    crown2Geo.translate(0, 8.2, 0);
+    const crown2Mat = new THREE.MeshStandardMaterial({ color: 0x26593d, roughness: 0.82 });
+
+    const trunkInst = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
+    const crown1Inst = new THREE.InstancedMesh(crown1Geo, crown1Mat, treeCount);
+    const crown2Inst = new THREE.InstancedMesh(crown2Geo, crown2Mat, treeCount);
+    crown1Inst.castShadow = castShadow;
+    crown2Inst.castShadow = castShadow;
+
+    let placed = 0;
+    let attempt = 0;
+    while (placed < treeCount && attempt < 2600) {
+      attempt++;
+      const angle = hash2D(attempt * 1.3, 7.1) * Math.PI * 2;
+      const radius = 52 + hash2D(attempt * 2.1, 13.7) * 340;
+      const tx = Math.cos(angle) * radius;
+      const tz = Math.sin(angle) * radius;
+
+      let minD2 = Infinity;
+      let baseY = 0;
+      for (let sIdx = 0; sIdx < SAMPLE_COUNT; sIdx += 4) {
+        const sp = samples[sIdx].point;
+        const dx = tx - sp.x;
+        const dz = tz - sp.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < minD2) {
+          minD2 = d2;
+          baseY = sp.y;
+        }
+      }
+      if (minD2 < (halfW + 16) * (halfW + 16)) continue;
+      if (
+        circuit.environment.waterColor &&
+        tx > -85 &&
+        tx < 130 &&
+        tz > -115 &&
+        tz < 115
+      ) {
+        continue;
+      }
+
+      const scale = 0.8 + hash2D(attempt, 99.1) * 0.95;
+      dummy.position.set(tx, baseY - 0.35, tz);
+      dummy.rotation.set(0, hash2D(attempt, 3.3) * Math.PI * 2, 0);
+      dummy.scale.set(scale, scale, scale);
+      dummy.updateMatrix();
+
+      trunkInst.setMatrixAt(placed, dummy.matrix);
+      crown1Inst.setMatrixAt(placed, dummy.matrix);
+      crown2Inst.setMatrixAt(placed, dummy.matrix);
+
+      const shade = 0.8 + hash2D(attempt, 41.2) * 0.35;
+      cColor.setRGB(0.14 * shade, 0.34 * shade, 0.22 * shade);
+      crown1Inst.setColorAt(placed, cColor);
+      crown2Inst.setColorAt(placed, cColor.clone().offsetHSL(0, 0, 0.04));
+
+      placed++;
+    }
+    trunkInst.count = placed;
+    crown1Inst.count = placed;
+    crown2Inst.count = placed;
+    trunkInst.computeBoundingSphere();
+    crown1Inst.computeBoundingSphere();
+    crown2Inst.computeBoundingSphere();
+    group.add(trunkInst, crown1Inst, crown2Inst);
+    disposables.push(trunkGeo, trunkMat, crown1Geo, crown1Mat, crown2Geo, crown2Mat);
+  }
+
+  if (circuit.environment.type === 'urban' || circuit.environment.type === 'night') {
+    const isNight = circuit.environment.type === 'night';
+    const bMat1 = new THREE.MeshStandardMaterial({
+      color: isNight ? 0x1e293b : 0x334155,
+      emissive: isNight ? 0x0ea5e9 : 0x000000,
+      emissiveIntensity: isNight ? 0.16 : 0,
+      roughness: 0.65,
+    });
+    const bMat2 = new THREE.MeshStandardMaterial({
+      color: isNight ? 0x0f172a : 0x475569,
+      emissive: isNight ? 0xf59e0b : 0x000000,
+      emissiveIntensity: isNight ? 0.12 : 0,
+      roughness: 0.65,
+    });
+    const roofMat = new THREE.MeshStandardMaterial({ color: 0x991b1b, roughness: 0.6 });
+    disposables.push(bMat1, bMat2, roofMat);
+
+    for (let i = 0; i < 24; i++) {
+      const sIdx = (i * 15) % SAMPLE_COUNT;
+      const s = samples[sIdx];
+      const side = i % 2 === 0 ? 1 : -1;
+      const dist = halfW + 22 + (i % 3) * 8;
+      const bx = s.point.x + s.right.x * side * dist;
+      const bz = s.point.z + s.right.z * side * dist;
+      const h = 10 + (i % 5) * 5.5;
+      const w = 10 + (i % 3) * 4;
+      const building = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, w * 0.8),
+        i % 2 === 0 ? bMat1 : bMat2
+      );
+      building.position.set(bx, s.point.y + h * 0.5 - 0.5, bz);
+      building.rotation.y = Math.atan2(s.tangent.x, s.tangent.z);
+      building.castShadow = castShadow;
+      building.receiveShadow = true;
+      group.add(building);
+
+      const roof = new THREE.Mesh(new THREE.ConeGeometry(w * 0.75, 2.8, 4), roofMat);
+      roof.position.set(bx, s.point.y + h + 0.85, bz);
+      roof.rotation.y = building.rotation.y + Math.PI / 4;
+      group.add(roof);
+      disposables.push(building.geometry, roof.geometry);
+    }
+  } else if (circuit.environment.type === 'river') {
+    const bridgeSample = samples[92];
+    const bHeading = Math.atan2(bridgeSample.tangent.x, bridgeSample.tangent.z);
+    const towerMat = new THREE.MeshStandardMaterial({
+      color: 0xe2e8f0,
+      metalness: 0.6,
+      roughness: 0.3,
+    });
+    const cableMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.8 });
+    disposables.push(towerMat, cableMat);
+
+    const bridgeGroup = new THREE.Group();
+    bridgeGroup.position.copy(bridgeSample.point);
+    bridgeGroup.rotation.y = bHeading;
+
+    [-halfW - 1.5, halfW + 1.5].forEach((tx) => {
+      const pylon = new THREE.Mesh(new THREE.BoxGeometry(1.1, 24, 1.4), towerMat);
+      pylon.position.set(tx, 10, 0);
+      pylon.castShadow = castShadow;
+      bridgeGroup.add(pylon);
+      disposables.push(pylon.geometry);
+    });
+    const topArch = new THREE.Mesh(
+      new THREE.BoxGeometry(circuit.trackWidth + 4.4, 1.4, 1.2),
+      towerMat
+    );
+    topArch.position.set(0, 21.5, 0);
+    bridgeGroup.add(topArch);
+    disposables.push(topArch.geometry);
+
+    [-halfW - 1.5, halfW + 1.5].forEach((tx) => {
+      const cCurve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(tx, 1.2, -32),
+        new THREE.Vector3(tx, 21.5, 0),
+        new THREE.Vector3(tx, 1.2, 32),
+      ]);
+      const cable = new THREE.Mesh(new THREE.TubeGeometry(cCurve, 20, 0.16, 6, false), cableMat);
+      bridgeGroup.add(cable);
+      disposables.push(cable.geometry);
+    });
+    group.add(bridgeGroup);
+  } else if (circuit.environment.type === 'lake') {
+    const marbleMat = new THREE.MeshStandardMaterial({
+      color: 0xdbeafe,
+      roughness: 0.45,
+      metalness: 0.1,
+    });
+    disposables.push(marbleMat);
+    const rockSpots = [
+      [-15, 0, -25, 14, 12],
+      [35, 0, 15, 18, 16],
+      [70, 0, -55, 12, 11],
+      [-50, 0, 40, 16, 14],
+    ];
+    rockSpots.forEach(([rx, , rz, rad, h]) => {
+      const geo = new THREE.DodecahedronGeometry(rad, 1);
+      geo.scale(1.2, h / rad, 0.9);
+      const rock = new THREE.Mesh(geo, marbleMat);
+      rock.position.set(rx, (circuit.environment.waterLevel ?? -1.6) + h * 0.35, rz);
+      rock.castShadow = castShadow;
+      rock.receiveShadow = true;
+      group.add(rock);
+      disposables.push(geo);
+    });
+  } else if (circuit.environment.type === 'desert') {
+    const mesaMat = new THREE.MeshStandardMaterial({
+      color: 0xb45309,
+      roughness: 0.88,
+    });
+    disposables.push(mesaMat);
+    for (let i = 0; i < 16; i++) {
+      const s = samples[(i * 22) % SAMPLE_COUNT];
+      const side = i % 2 === 0 ? 1 : -1;
+      const dist = halfW + 26 + (i % 4) * 14;
+      const geo = new THREE.CylinderGeometry(6, 14, 18 + (i % 3) * 8, 7);
+      const mesa = new THREE.Mesh(geo, mesaMat);
+      mesa.position.set(
+        s.point.x + s.right.x * side * dist,
+        s.point.y + 8,
+        s.point.z + s.right.z * side * dist
+      );
+      mesa.castShadow = castShadow;
+      group.add(mesa);
+      disposables.push(geo);
+    }
+  }
+
+  const setStartLights = (litCount: number) => {
+    for (let i = 0; i < 5; i++) {
+      const active = i < litCount;
+      startLightMats[i].emissiveIntensity = active ? 4.2 : 0.05;
+      startLightMats[i].color.setHex(active ? 0xff1e2d : 0x3f0a12);
+    }
+  };
+
+  const updateCrowd = (elapsedSec: number, pitActive = false) => {
+    fanUniformTime.value = elapsedSec;
+    for (let i = 0; i < wavingBanners.length; i++) {
+      const wb = wavingBanners[i];
+      wb.group.rotation.z = Math.sin(elapsedSec * 4.8 + wb.phase) * 0.16;
+      wb.group.position.y =
+        wb.baseY + Math.max(0, Math.sin(elapsedSec * 6.0 + wb.phase)) * 0.18;
+    }
+    for (let i = 0; i < pitCrewMechanics.length; i++) {
+      const m = pitCrewMechanics[i];
+      if (pitActive && m.role === 'wheel') {
+        const workPulse = Math.abs(Math.sin(elapsedSec * 11 + m.phase));
+        m.group.position.x = m.baseX + m.sideSign * (0.35 + workPulse * 0.25);
+        m.group.position.y = workPulse * 0.12;
+      } else {
+        m.group.position.x = m.baseX;
+        m.group.position.y = Math.max(0, Math.sin(elapsedSec * 5.2 + m.phase)) * 0.08;
+      }
+    }
+    for (let i = 0; i < emergencyBeacons.length; i++) {
+      const eb = emergencyBeacons[i];
+      const flash = Math.sin(elapsedSec * 12 + eb.phase) > 0;
+      eb.blueMat.color.setHex(flash ? 0x60a5fa : 0x1e3a8a);
+      eb.redMat.color.setHex(flash ? 0x7f1d1d : 0xf87171);
+    }
+  };
+
+  const dispose = () => {
+    disposables.forEach((d) => d.dispose());
+  };
+
+  return {
+    group,
+    curve,
+    samples,
+    totalLength,
+    startLightMeshes,
+    startLightMats,
+    pitBox: {
+      position: pitPos,
+      heading: pitHeading,
+      sampleIndex: pitSampleIdx,
+      lateralOffset: pitLat,
+    },
+    pitRoadPoints,
+    pitEntryIndex,
+    pitExitIndex,
+    closestPointOnTrack,
+    setStartLights,
+    updateCrowd,
+    dispose,
+  };
+}
