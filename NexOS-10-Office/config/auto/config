@@ -1,0 +1,19 @@
+#!/bin/sh
+# Debian live-build configuration for NexOS 10 Office.
+set -eu
+
+lb config noauto \
+  --mode debian \
+  --distribution trixie \
+  --architectures amd64 \
+  --binary-images iso-hybrid \
+  --bootloaders grub-efi \
+  --archive-areas 'main contrib non-free-firmware' \
+  --debian-installer false \
+  --iso-application 'NexOS 10 Office Live' \
+  --iso-publisher 'NexPlay — Tecnología Chilena' \
+  --iso-volume 'NEXOS_10_OFFICE' \
+  --image-name 'nexos-10-office-amd64' \
+  --linux-flavours amd64 \
+  --memtest none \
+  --apt-recommends false

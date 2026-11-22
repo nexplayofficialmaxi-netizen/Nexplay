@@ -1,0 +1,4 @@
+#!/bin/sh
+# Build entry point used by `lb build` and scripts/build-live.sh.
+set -eu
+lb build noauto "$@"

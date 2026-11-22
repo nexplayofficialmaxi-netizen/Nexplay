@@ -1,0 +1,4 @@
+#!/bin/sh
+# Deliberately do not run `lb clean` here: cleaning is an explicit user action.
+set -eu
+exit 0

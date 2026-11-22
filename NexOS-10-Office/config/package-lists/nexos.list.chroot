@@ -1,0 +1,20 @@
+# Minimal X11 session, Openbox window manager, file manager, terminal, and live boot.
+# Intentionally no Electron shell or browser in the first image; measure the baseline first.
+live-boot
+live-config
+live-config-systemd
+systemd-sysv
+linux-image-amd64
+firmware-linux
+xserver-xorg
+xserver-xorg-input-libinput
+openbox
+obconf
+lightdm
+lightdm-gtk-greeter
+network-manager
+network-manager-gnome
+pcmanfm
+lxterminal
+fonts-dejavu-core
+x11-xserver-utils

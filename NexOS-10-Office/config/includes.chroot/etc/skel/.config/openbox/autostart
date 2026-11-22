@@ -1,0 +1,3 @@
+# User session startup for the initial Openbox desktop.
+# Keep this lean. NexOS web shell integration will be added in a later tested stage.
+xsetroot -solid '#07143b' || true

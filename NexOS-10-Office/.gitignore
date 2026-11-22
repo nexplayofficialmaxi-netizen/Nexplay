@@ -1,0 +1,7 @@
+# Generated live-build outputs; keep source config and scripts tracked.
+*.iso
+*.iso.*
+binary/
+chroot/
+.cache/
+.build/

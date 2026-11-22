@@ -1,0 +1,8 @@
+# NexOS graphical session definition (Openbox is the initial shell foundation).
+[Desktop Entry]
+Name=NexOS 10 Office
+Comment=Escritorio ligero de NexPlay
+Exec=openbox-session
+TryExec=openbox-session
+Type=Application
+DesktopNames=NexOS
